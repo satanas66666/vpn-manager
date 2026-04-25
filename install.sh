@@ -4,7 +4,7 @@ clear
 echo "===== VPN MANAGER AUTO INSTALL ====="
 
 BASE="/opt/vpnmanager"
-REPO="https://raw.githubusercontent.com/TU-USUARIO/vpn-manager/main"
+REPO="https://raw.githubusercontent.com/satanas66666/vpn-manager/main"
 
 read -p "Puerto para API (ej: 8080): " PORT
 
