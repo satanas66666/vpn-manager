@@ -1,243 +1,252 @@
 #!/bin/bash
 
-DB="/etc/vpnmanager"
-PASS_FILE="$DB/password.txt"
-USER_FILE="$DB/users.txt"
-PORT_FILE="$DB/port.txt"
-LIMIT_FILE="$DB/limits.txt"
-BLOCK_FILE="$DB/blocked.txt"
-
-mkdir -p $DB
-touch $USER_FILE $LIMIT_FILE $BLOCK_FILE
+BASE="/opt/vpnmanager"
+DB="$BASE/usuarios.db"
+PASS_FILE="$BASE/pass.txt"
 
 # =========================
-# 🔐 PASSWORD
+# 🔐 VALIDAR CONTRASEÑA
 # =========================
-function get_password(){
-    if [ ! -f "$PASS_FILE" ]; then
-        echo "🔐 Crear contraseña global:"
-        read pass
-        printf "%s" "$pass" > $PASS_FILE
-    fi
-}
+check_password() {
 
-function verify_password(){
     if [ ! -f "$PASS_FILE" ]; then
-        get_password
+        return 0
     fi
 
-    echo "🔐 Ingrese contraseña:"
-    read input
+    echo -ne "🔐 Ingrese contraseña: "
+    read PASS
 
-    saved=$(cat $PASS_FILE | tr -d '\r\n')
+    SAVED_PASS=$(cat $PASS_FILE)
 
-    if [ "$input" != "$saved" ]; then
+    if [ "$PASS" != "$SAVED_PASS" ]; then
+        echo ""
         echo "❌ Contraseña incorrecta"
         sleep 2
+        menu
         return 1
     fi
+
     return 0
 }
 
-function cambiar_password(){
-    clear
-    verify_password || return
+# =========================
+# 🔑 CREAR PASSWORD GLOBAL
+# =========================
+create_password() {
 
-    echo "🔑 Nueva contraseña:"
-    read newpass
+    if [ -f "$PASS_FILE" ]; then
+        return
+    fi
 
-    printf "%s" "$newpass" > $PASS_FILE
+    echo ""
+    echo "🔐 Crear contraseña global:"
+    read PASS
+
+    echo "$PASS" > $PASS_FILE
+}
+
+# =========================
+# 🔁 CAMBIAR PASSWORD
+# =========================
+change_password() {
+
+    check_password || return
+
+    echo ""
+    echo "🔁 Nueva contraseña:"
+    read NEWPASS
+
+    echo "$NEWPASS" > $PASS_FILE
 
     echo "✅ Contraseña actualizada"
-    sleep 2
+
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
 # =========================
-# 👥 USUARIOS
+# ➕ CREAR USUARIO
 # =========================
-function crear(){
+crear_usuario() {
+
+    check_password || return
+
     clear
-    get_password
+    echo "===== CREAR USUARIO ====="
 
-    echo "👤 Usuario:"
-    read user
+    read -p "Usuario: " user
+    read -p "Días de duración: " dias
+    read -p "Límite de conexiones: " limit
 
-    echo "⏳ Días:"
-    read days
+    fecha=$(date -d "+$dias days" +"%d%m%Y")
 
-    echo "🔢 Límite de conexiones:"
-    read limit
+    echo "$user|$fecha|$limit" >> $DB
 
-    exp=$(date -d "+$days days" +%Y-%m-%d)
+    echo ""
+    echo "✅ Usuario creado"
+    echo "Usuario: $user"
+    echo "Expira: $fecha"
+    echo "Límite: $limit"
 
-    echo "$user|$exp" >> $USER_FILE
-    echo "$user|$limit" >> $LIMIT_FILE
-
-    echo "✅ Usuario creado con límite $limit"
-    sleep 2
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
-function listar(){
-    echo "===== USUARIOS ====="
-    while IFS="|" read u exp; do
-        lim=$(grep "^$u|" $LIMIT_FILE | cut -d'|' -f2)
-        echo "$u | Expira: $exp | Limite: $lim"
-    done < $USER_FILE
-}
+# =========================
+# 🔄 RENOVAR USUARIO
+# =========================
+renovar_usuario() {
 
-function renovar(){
+    check_password || return
+
     clear
-    verify_password || return
+    echo "===== RENOVAR USUARIO ====="
+    cut -d '|' -f1 $DB
 
-    listar
-    echo "Usuario:"
-    read user
+    echo ""
+    read -p "Usuario: " user
+    read -p "Días a agregar: " dias
 
-    echo "Días extra:"
-    read days
+    nueva_fecha=$(date -d "+$dias days" +"%d%m%Y")
 
-    newdate=$(date -d "+$days days" +%Y-%m-%d)
-
-    sed -i "s|^$user|.*|$user|$newdate|" $USER_FILE
+    sed -i "s/^$user|.*/$user|$nueva_fecha|$(grep "^$user|" $DB | cut -d '|' -f3)/" $DB
 
     echo "✅ Renovado"
-    sleep 2
+
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
-function eliminar(){
+# =========================
+# ❌ ELIMINAR USUARIO
+# =========================
+eliminar_usuario() {
+
+    check_password || return
+
     clear
-    verify_password || return
+    echo "===== ELIMINAR USUARIO ====="
+    cut -d '|' -f1 $DB
 
-    listar
-    echo "Usuario:"
-    read user
+    echo ""
+    read -p "Usuario a eliminar: " user
 
-    sed -i "/^$user|/d" $USER_FILE
-    sed -i "/^$user|/d" $LIMIT_FILE
-    sed -i "/^$user$/d" $BLOCK_FILE
+    sed -i "/^$user|/d" $DB
 
-    echo "🗑 Eliminado"
-    sleep 2
+    echo "✅ Eliminado"
+
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
 # =========================
-# 🔒 BLOQUEOS
+# 📋 LISTAR USUARIOS
 # =========================
-function ver_bloqueados(){
-    echo "🚫 Usuarios bloqueados:"
-    cat $BLOCK_FILE
-    read -p "Enter para continuar"
-}
+listar_usuarios() {
 
-function desbloquear(){
+    check_password || return
+
     clear
-    verify_password || return
+    echo "===== LISTA DE USUARIOS ====="
+    echo ""
 
-    ver_bloqueados
-
-    echo "Usuario a desbloquear:"
-    read user
-
-    sed -i "/^$user$/d" $BLOCK_FILE
-
-    echo "✅ Desbloqueado"
-    sleep 2
-}
-
-# =========================
-# 🌐 API
-# =========================
-function estado_api(){
-    systemctl is-active apache2 >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        echo "🟢 API ACTIVA"
+    if [ ! -s "$DB" ]; then
+        echo "No hay usuarios"
     else
-        echo "🔴 API DETENIDA"
+        awk -F'|' '{print "👤",$1,"| Expira:",$2,"| Límite:",$3}' $DB
     fi
+
+    echo ""
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
-function toggle_api(){
-    clear
-    verify_password || return
+# =========================
+# 🚫 BLOQUEADOS (FUTURO)
+# =========================
+desbloquear_usuario() {
 
-    systemctl is-active apache2 >/dev/null 2>&1
+    check_password || return
 
-    if [ $? -eq 0 ]; then
+    echo "Función en proceso..."
+
+    read -p "ENTER para volver..." tmp
+    menu
+}
+
+# =========================
+# 📡 ESTADO API
+# =========================
+toggle_api() {
+
+    check_password || return
+
+    if systemctl is-active apache2 > /dev/null; then
         systemctl stop apache2
-        echo "🔴 API DETENIDA"
+        echo "❌ API apagada"
     else
         systemctl start apache2
-        echo "🟢 API INICIADA"
+        echo "✅ API encendida"
     fi
 
-    sleep 2
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
 # =========================
-# 🔌 PUERTO
+# 🔁 CAMBIAR PUERTO
 # =========================
-function obtener_puerto(){
-    if [ -f "$PORT_FILE" ]; then
-        cat $PORT_FILE
-    else
-        grep -i listen /etc/apache2/ports.conf | awk '{print $2}'
-    fi
-}
+cambiar_puerto() {
 
-function cambiar_puerto(){
-    clear
-    verify_password || return
+    check_password || return
 
-    echo "Puerto actual: $(obtener_puerto)"
-    echo "Nuevo puerto:"
-    read newport
+    read -p "Nuevo puerto: " PORT
 
-    sed -i "s/Listen .*/Listen $newport/" /etc/apache2/ports.conf
-    sed -i "s/<VirtualHost \*:.*/<VirtualHost *:$newport>/" /etc/apache2/sites-enabled/000-default.conf
-
-    echo "$newport" > $PORT_FILE
+    sed -i "s/Listen .*/Listen $PORT/" /etc/apache2/ports.conf
+    sed -i "s/<VirtualHost \*:.*/<VirtualHost *:$PORT>/" /etc/apache2/sites-enabled/000-default.conf
 
     systemctl restart apache2
 
-    echo "✅ Puerto cambiado"
-    sleep 2
+    echo "✅ Puerto cambiado a $PORT"
+
+    read -p "ENTER para volver..." tmp
+    menu
 }
 
 # =========================
-# 🧠 MENU
+# 🧠 MENÚ PRINCIPAL
 # =========================
-while true; do
-clear
-echo "======== VPN MANAGER PRO ========"
-estado_api
-echo "Puerto: $(obtener_puerto)"
-echo "--------------------------------"
-echo "1) Crear usuario"
-echo "2) Renovar usuario"
-echo "3) Eliminar usuario"
-echo "4) Listar usuarios"
-echo "5) Cambiar contraseña"
-echo "6) ON/OFF API"
-echo "7) Cambiar puerto"
-echo "8) Ver bloqueados"
-echo "9) Desbloquear usuario"
-echo "0) Salir"
-echo "================================"
-read -p "Opción: " op
+menu() {
 
-case $op in
-1) crear ;;
-2) renovar ;;
-3) eliminar ;;
-4) clear; listar; read ;;
-5) cambiar_password ;;
-6) toggle_api ;;
-7) cambiar_puerto ;;
-8) clear; ver_bloqueados ;;
-9) desbloquear ;;
-0) exit ;;
-*) echo "Opción inválida"; sleep 1 ;;
-esac
+    clear
+    echo "====== VPN MANAGER PRO ======"
+    echo "1) Crear usuario"
+    echo "2) Renovar usuario"
+    echo "3) Eliminar usuario"
+    echo "4) Listar usuarios"
+    echo "5) Cambiar contraseña"
+    echo "6) Encender/Apagar API"
+    echo "7) Cambiar puerto"
+    echo "0) Salir"
+    echo "============================="
+    read -p "Seleccione: " op
 
-done
+    case $op in
+        1) crear_usuario ;;
+        2) renovar_usuario ;;
+        3) eliminar_usuario ;;
+        4) listar_usuarios ;;
+        5) change_password ;;
+        6) toggle_api ;;
+        7) cambiar_puerto ;;
+        0) exit ;;
+        *) menu ;;
+    esac
+}
+
+# =========================
+# 🚀 INICIO
+# =========================
+create_password
+menu
 
