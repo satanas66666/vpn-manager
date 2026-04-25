@@ -1,59 +1,121 @@
 #!/bin/bash
 
-export TZ="America/Mexico_City"
-DB="/opt/vpnmanager/usuarios.db"
+clear
 
-fecha(){ date -d "+$1 days" +"%d%m%Y"; }
+DATA_FILE="/etc/vpn_users"
 
-echo "====== VPN MANAGER ======"
-echo "1) Crear usuario"
-echo "2) Renovar usuario"
-echo "3) Eliminar usuario"
-echo "4) Listar usuarios"
-echo "0) Salir"
-read op
+# Crear archivo si no existe
+[ ! -f $DATA_FILE ] && touch $DATA_FILE
 
-case $op in
+pause(){
+    echo ""
+    read -p "Presiona ENTER para continuar..."
+}
 
-1)
-read -p "Token: " t
-read -p "Dias: " d
-read -p "Password: " p
+menu(){
+    clear
+    echo "========== VPN MANAGER PRO =========="
+    echo "1) Crear usuario"
+    echo "2) Renovar usuario"
+    echo "3) Eliminar usuario"
+    echo "4) Listar usuarios"
+    echo "0) Salir"
+    echo "====================================="
+    read -p "Seleccione una opción: " op
+}
 
-echo "$t|$(fecha $d)" >> $DB
+listar(){
+    clear
+    echo "====== LISTA DE USUARIOS ======"
+    if [ ! -s $DATA_FILE ]; then
+        echo "No hay usuarios registrados"
+    else
+        nl -w2 -s') ' $DATA_FILE
+    fi
+    echo "==============================="
+}
 
-useradd -m $t 2>/dev/null
-echo "$t:$p" | chpasswd
+crear(){
+    clear
+    echo "====== CREAR USUARIO ======"
+    read -p "Usuario: " user
+    read -p "Duración (días): " dias
 
-echo "Usuario creado"
-;;
+    exp=$(date -d "+$dias days" +"%Y-%m-%d")
+    token=$(openssl rand -hex 4)
 
-2)
-read -p "Token: " t
-read -p "Dias: " d
+    echo "$user|$exp|$token" >> $DATA_FILE
 
-f=$(grep "^$t|" $DB | cut -d'|' -f2)
-n=$(date -d "${f:0:2}-${f:2:2}-${f:4:4} +$d days" +"%d%m%Y")
+    echo ""
+    echo "✔ Usuario creado"
+    echo "Usuario: $user"
+    echo "Expira: $exp"
+    echo "Token: $token"
+    pause
+}
 
-sed -i "s/^$t|.*/$t|$n/" $DB
+seleccionar_usuario(){
+    listar
+    echo ""
+    read -p "Seleccione número: " num
 
-echo "Renovado"
-;;
+    user_line=$(sed -n "${num}p" $DATA_FILE)
 
-3)
-read -p "Token: " t
+    if [ -z "$user_line" ]; then
+        echo "❌ Opción inválida"
+        pause
+        return 1
+    fi
 
-userdel -r $t 2>/dev/null
-sed -i "/^$t|/d" $DB
+    return 0
+}
 
-echo "Eliminado"
-;;
+renovar(){
+    seleccionar_usuario || return
 
-4)
-cat $DB
-;;
+    user=$(echo $user_line | cut -d'|' -f1)
+    read -p "Días a agregar: " dias
 
-0) exit;;
+    nueva_fecha=$(date -d "+$dias days" +"%Y-%m-%d")
 
-esac
+    sed -i "${num}s|.*|$user|$nueva_fecha|$(echo $user_line | cut -d'|' -f3)|" $DATA_FILE
+
+    echo ""
+    echo "✔ Usuario renovado"
+    echo "Nueva fecha: $nueva_fecha"
+    pause
+}
+
+eliminar(){
+    seleccionar_usuario || return
+
+    user=$(echo $user_line | cut -d'|' -f1)
+    token=$(echo $user_line | cut -d'|' -f3)
+
+    echo ""
+    read -p "¿Eliminar usuario $user? (y/n): " confirm
+
+    if [[ "$confirm" == "y" ]]; then
+        sed -i "${num}d" $DATA_FILE
+        echo "✔ Usuario eliminado"
+        echo "Token liberado: $token"
+    else
+        echo "Cancelado"
+    fi
+
+    pause
+}
+
+# LOOP PRINCIPAL
+while true; do
+    menu
+    case $op in
+        1) crear ;;
+        2) renovar ;;
+        3) eliminar ;;
+        4) listar; pause ;;
+        0) exit ;;
+        *) echo "Opción inválida"; pause ;;
+    esac
+done
 
