@@ -3,7 +3,7 @@
 clear
 echo "===== VPN MANAGER AUTO INSTALL ====="
 
-# Verificar root
+# 🔐 Verificar root
 if [ "$(id -u)" != "0" ]; then
    echo "Ejecuta como root"
    exit 1
@@ -12,20 +12,29 @@ fi
 BASE="/opt/vpnmanager"
 REPO="https://raw.githubusercontent.com/satanas66666/vpn-manager/main"
 
+# 🌐 Obtener IP automáticamente
+IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+
 read -p "Puerto para API (ej: 8080): " PORT
+
+# Validar puerto
+if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
+    echo "❌ Puerto inválido"
+    exit 1
+fi
 
 echo "Instalando dependencias..."
 apt update -y
-apt install apache2 wget -y
+apt install apache2 wget curl -y
 
 echo "Activando CGI..."
 a2enmod cgi
 
-echo "Configurando puerto seguro..."
+echo "Configurando puerto..."
 
-# Cambiar puerto correctamente
-sed -i "s/Listen 80/Listen $PORT/g" /etc/apache2/ports.conf
-sed -i "s/<VirtualHost \*:80>/<VirtualHost \*:$PORT>/g" /etc/apache2/sites-enabled/000-default.conf
+# 🔥 Evitar errores si ya se cambió antes
+sed -i "s/Listen .*/Listen $PORT/" /etc/apache2/ports.conf
+sed -i "s/<VirtualHost \*:.*/<VirtualHost *:$PORT>/" /etc/apache2/sites-enabled/000-default.conf
 
 echo "Configurando zona horaria..."
 timedatectl set-timezone America/Mexico_City
@@ -33,7 +42,8 @@ timedatectl set-timezone America/Mexico_City
 echo "Creando directorios..."
 mkdir -p $BASE
 touch $BASE/usuarios.db
-chmod 777 $BASE/usuarios.db
+touch $BASE/bloqueados.db
+chmod 777 $BASE/*.db
 
 cd $BASE || exit
 
@@ -43,9 +53,9 @@ wget -q -O manager.sh $REPO/manager.sh
 wget -q -O api_check.sh $REPO/api_check.sh
 wget -q -O expire.sh $REPO/expire.sh
 
-# Verificar descargas
+# 🔴 Verificar descargas
 if [ ! -s manager.sh ] || [ ! -s api_check.sh ]; then
-    echo "Error descargando archivos"
+    echo "❌ Error descargando archivos del repo"
     exit 1
 fi
 
@@ -66,10 +76,11 @@ echo "Configurando auto-expiración..."
 echo "Reiniciando Apache..."
 systemctl restart apache2
 
+# 🔥 MOSTRAR RESULTADO CORRECTO
 echo "=================================="
 echo " INSTALACIÓN COMPLETA ✅"
 echo "=================================="
 echo "Comando: checkuser"
-echo "API: http://IP:$PORT/cgi-bin/checkUser"
+echo "API: http://$IP:$PORT/cgi-bin/checkUser"
 echo "=================================="
 
