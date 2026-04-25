@@ -20,7 +20,7 @@ function pause(){
 function get_password(){
     if [ ! -f "$PASS_FILE" ]; then
         echo "🔐 Crear contraseña global:"
-        read -s pass
+        read pass
         echo "$pass" > $PASS_FILE
     fi
 }
@@ -31,7 +31,7 @@ function verify_password(){
     fi
 
     echo "🔐 Ingrese contraseña:"
-    read -s input
+    read input
 
     saved=$(cat $PASS_FILE)
 
@@ -48,7 +48,7 @@ function cambiar_password(){
     verify_password || return
 
     echo "🔑 Nueva contraseña:"
-    read -s newpass
+    read newpass
 
     echo "$newpass" > $PASS_FILE
 
@@ -153,15 +153,21 @@ function toggle_api(){
 }
 
 # =========================
-# 🔌 CAMBIAR PUERTO
+# 🔌 PUERTO API
 # =========================
+function obtener_puerto(){
+    if [ -f "$PORT_FILE" ]; then
+        cat $PORT_FILE
+    else
+        grep -i listen /etc/apache2/ports.conf | awk '{print $2}'
+    fi
+}
+
 function cambiar_puerto(){
     clear
     verify_password || return
 
-    echo "Puerto actual:"
-    grep -i listen /etc/apache2/ports.conf
-
+    echo "🌐 Puerto actual: $(obtener_puerto)"
     echo ""
     echo "Nuevo puerto:"
     read newport
@@ -172,7 +178,6 @@ function cambiar_puerto(){
         return
     fi
 
-    # Cambiar puerto
     sed -i "s/Listen .*/Listen $newport/" /etc/apache2/ports.conf
     sed -i "s/<VirtualHost \*:.*/<VirtualHost *:$newport>/" /etc/apache2/sites-enabled/000-default.conf
 
@@ -185,13 +190,14 @@ function cambiar_puerto(){
 }
 
 # =========================
-# 🧠 MENU PRINCIPAL
+# 🧠 MENU
 # =========================
 function menu(){
 while true; do
     clear
     echo "======== VPN MANAGER PRO ========"
     estado_api
+    echo "🌐 Puerto API: $(obtener_puerto)"
     echo "--------------------------------"
     echo "1) Crear usuario"
     echo "2) Renovar usuario"
