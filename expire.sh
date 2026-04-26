@@ -1,17 +1,14 @@
 #!/bin/bash
 
+export TZ="America/Mexico_City"
 DB="/opt/vpnmanager/usuarios.db"
-TMP="/opt/vpnmanager/tmp.db"
-
-> $TMP
-
 HOY=$(date +%d%m%Y)
 
-while IFS="|" read user exp used limit; do
-if [ "$exp" -ge "$HOY" ]; then
-echo "$user|$exp|0|$limit" >> $TMP
+while IFS="|" read u e
+do
+if [ "$e" -lt "$HOY" ]; then
+userdel -r $u 2>/dev/null
+sed -i "/^$u|/d" $DB
 fi
 done < $DB
-
-mv $TMP $DB
 
