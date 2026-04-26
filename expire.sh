@@ -1,14 +1,18 @@
 #!/bin/bash
 
-export TZ="America/Mexico_City"
 DB="/opt/vpnmanager/usuarios.db"
-HOY=$(date +%d%m%Y)
+TMP="/opt/vpnmanager/tmp.db"
 
-while IFS="|" read u e
+> $TMP
+
+hoy=$(date +"%d%m%Y")
+
+while IFS="|" read user fecha
 do
-if [ "$e" -lt "$HOY" ]; then
-userdel -r $u 2>/dev/null
-sed -i "/^$u|/d" $DB
+if [ "$fecha" -ge "$hoy" ]; then
+echo "$user|$fecha" >> $TMP
 fi
 done < $DB
+
+mv $TMP $DB
 
