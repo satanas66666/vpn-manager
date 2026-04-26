@@ -23,17 +23,22 @@ fi
 
 unzip -q chido.zip -d extract
 
-# 🔥 DETECCIÓN INTELIGENTE
 echo "Buscando estructura correcta..."
 
-RUTA=$(find extract -type f -name "index.php" | head -n 1)
+# 🔥 BUSCAR carpeta que tenga index.php Y chidito1
+BASE_DIR=""
 
-if [ -z "$RUTA" ]; then
-    echo "Error: no se encontró index.php en el zip"
+for dir in $(find extract -type d); do
+    if [ -f "$dir/index.php" ] && [ -d "$dir/chidito1" ]; then
+        BASE_DIR="$dir"
+        break
+    fi
+done
+
+if [ -z "$BASE_DIR" ]; then
+    echo "Error: no se encontró estructura válida (index.php + chidito1)"
     exit 1
 fi
-
-BASE_DIR=$(dirname "$RUTA")
 
 echo "Estructura detectada en: $BASE_DIR"
 
@@ -46,9 +51,14 @@ mkdir -p "$CARPETA_ETC"
 
 cp -r "$BASE_DIR"/* "$CARPETA_ETC"
 
-# VALIDAR chidito1
+# VALIDACIÓN FINAL
+if [ ! -f "$CARPETA_ETC/index.php" ]; then
+    echo "Error final: falta index.php"
+    exit 1
+fi
+
 if [ ! -d "$CARPETA_ETC/chidito1" ]; then
-    echo "Error: falta carpeta chidito1"
+    echo "Error final: falta chidito1"
     exit 1
 fi
 
