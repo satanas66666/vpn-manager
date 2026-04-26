@@ -13,25 +13,19 @@ touch $DB
 touch $SESS
 
 # =========================
-# OBTENER IP REAL
+# IP REAL
 # =========================
 
 IP="$REMOTE_ADDR"
 
-# Evitar localhost o pruebas
-if [[ "$IP" == "127.0.0.1" ]]; then
-    echo "Test mode"
-    exit
-fi
-
 # =========================
-# DETECTAR NAVEGADOR
+# DETECTAR NAVEGADOR (NO CONTAR)
 # =========================
 
 UA="$HTTP_USER_AGENT"
 
 if echo "$UA" | grep -qiE "mozilla|chrome|safari"; then
-    echo "Access denied"
+    echo "Not exist"
     exit
 fi
 
@@ -39,12 +33,8 @@ fi
 # OBTENER USUARIO
 # =========================
 
-if [ "$REQUEST_METHOD" = "GET" ]; then
-    USER=$(echo "$QUERY_STRING" | sed -n 's/^user=\([^&]*\).*$/\1/p')
-else
-    read INPUT
-    USER=$(echo "$INPUT" | grep -oP '"user"\s*:\s*"\K[^"]+')
-fi
+read INPUT
+USER=$(echo "$INPUT" | grep -oP '"user"\s*:\s*"\K[^"]+')
 
 # Validar usuario
 if [[ ! "$USER" =~ ^[a-zA-Z0-9]+$ ]]; then
@@ -72,30 +62,29 @@ NOW=$(date +%s)
 
 # Expirado
 if [ "$EXP" -lt "$HOY" ]; then
-    echo "Expired"
+    echo "Not exist"
     exit
 fi
 
 # =========================
-# LIMPIAR SESIONES VIEJAS (5 min)
+# LIMPIAR SESIONES (5 min)
 # =========================
 
 awk -v now="$NOW" '$3 > now {print}' $SESS > $SESS.tmp && mv $SESS.tmp $SESS
 
 # =========================
-# CONTAR SESIONES ACTIVAS DEL USER
+# CONTAR ACTIVOS
 # =========================
 
 ACTIVE=$(grep "^$USER|" $SESS | wc -l)
 
 # =========================
-# VERIFICAR SI IP YA EXISTE
+# SI YA EXISTE ESA IP → RENOVAR
 # =========================
 
 EXIST=$(grep "^$USER|$IP|" $SESS)
 
 if [ -n "$EXIST" ]; then
-    # renovar sesión
     EXP_TIME=$((NOW + 300))
     sed -i "s|^$USER|$IP|.*|$USER|$IP|$EXP_TIME|" $SESS
     echo "$EXP"
@@ -107,7 +96,7 @@ fi
 # =========================
 
 if [ "$ACTIVE" -ge "$LIMIT" ]; then
-    echo "Limit reached"
+    echo "Not exist"
     exit
 fi
 
@@ -118,4 +107,6 @@ fi
 EXP_TIME=$((NOW + 300))
 echo "$USER|$IP|$EXP_TIME" >> $SESS
 
+# RESPUESTA FINAL (SOLO FECHA)
 echo "$EXP"
+
