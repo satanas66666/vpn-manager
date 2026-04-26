@@ -1,68 +1,93 @@
 #!/bin/bash
 
 clear
-echo "===== VPN MANAGER AUTO INSTALL ====="
-
-[ "$(id -u)" != "0" ] && echo "Ejecuta como root" && exit
+echo "===== VPN MANAGER AUTO INSTALL PRO ====="
 
 BASE="/opt/vpnmanager"
 REPO="https://raw.githubusercontent.com/satanas66666/vpn-manager/main"
 
-read -p "Puerto API (ej: 7080): " PORT
+read -p "Puerto API (ej: 8090): " PORT
 
+echo "Instalando dependencias..."
 apt update -y
-apt install apache2 wget -y
+apt install apache2 -y
 
-a2enmod cgi
+a2enmod cgi rewrite
 
-# Configurar puerto correctamente
-sed -i "s/Listen 80/Listen $PORT/g" /etc/apache2/ports.conf
+echo "Configurando puerto..."
+sed -i "s/80/$PORT/g" /etc/apache2/ports.conf
 sed -i "s/<VirtualHost \*:80>/<VirtualHost \*:$PORT>/g" /etc/apache2/sites-enabled/000-default.conf
 
-# Activar CGI en web root
-cat <<EOF >> /etc/apache2/sites-enabled/000-default.conf
-
-<Directory "/var/www/html">
-    Options +ExecCGI
-    AddHandler cgi-script .cgi .sh
-    Require all granted
-</Directory>
-
-ScriptAlias /checkUser /var/www/html/checkUser.cgi
-
-EOF
-
+echo "Configurando zona horaria México..."
 timedatectl set-timezone America/Mexico_City
 
+echo "Creando base..."
 mkdir -p $BASE
 touch $BASE/usuarios.db
 chmod 777 $BASE/usuarios.db
 
 cd $BASE
 
-wget -q -O manager.sh $REPO/manager.sh
-wget -q -O api_check.sh $REPO/api_check.sh
-wget -q -O expire.sh $REPO/expire.sh
+echo "Descargando scripts..."
+wget -O manager.sh $REPO/manager.sh
+wget -O api_check.sh $REPO/api_check.sh
+wget -O expire.sh $REPO/expire.sh
 
-chmod +x manager.sh api_check.sh expire.sh
+chmod +x *.sh
 
-# API directa sin /cgi-bin
-cp api_check.sh /var/www/html/checkUser.cgi
-chmod +x /var/www/html/checkUser.cgi
+echo "Instalando API limpia..."
 
-# comando global
+cat > /usr/lib/cgi-bin/checkUser <<'EOF'
+#!/bin/bash
+
+echo "Content-type: text/plain"
+echo ""
+
+read INPUT
+USER=$(echo $INPUT | grep -oP '"user":"\K[^"]+')
+
+DB="/opt/vpnmanager/usuarios.db"
+
+LINE=$(grep "^$USER|" $DB)
+
+if [ -z "$LINE" ]; then
+    echo "Not exist"
+else
+    FECHA=$(echo $LINE | cut -d'|' -f2)
+    echo "$FECHA"
+fi
+EOF
+
+chmod +x /usr/lib/cgi-bin/checkUser
+
+echo "Activando URL limpia /checkUser..."
+
+cat >> /etc/apache2/sites-enabled/000-default.conf <<EOF
+
+ScriptAlias /checkUser /usr/lib/cgi-bin/checkUser
+
+<Directory "/usr/lib/cgi-bin">
+    AllowOverride None
+    Options +ExecCGI
+    Require all granted
+</Directory>
+EOF
+
+echo "Creando comando global..."
 echo -e "#!/bin/bash\nbash $BASE/manager.sh" > /usr/bin/checkuser
 chmod +x /usr/bin/checkuser
 
-# cron
+echo "Configurando auto-expiración..."
 (crontab -l 2>/dev/null; echo "0 * * * * bash $BASE/expire.sh") | crontab -
+
+echo "Abriendo puerto..."
+ufw allow $PORT/tcp 2>/dev/null
 
 systemctl restart apache2
 
-echo "================================="
-echo " INSTALADO CORRECTAMENTE"
-echo "================================="
-echo "URL API:"
+echo ""
+echo "===== INSTALADO CORRECTAMENTE ====="
+echo "Comando: checkuser"
+echo "API lista en:"
 echo "http://IP:$PORT/checkUser"
-echo "================================="
 
