@@ -1,159 +1,163 @@
 #!/bin/bash
 
-DB="/opt/vpnmanager/usuarios.db"
-PORT_FILE="/opt/vpnmanager/port.conf"
+BASE="/opt/vpnmanager"
+DB="$BASE/usuarios.db"
+PORT_FILE="$BASE/puerto.txt"
 
 # Colores
-verde="\e[1;32m"
-rojo="\e[1;31m"
-azul="\e[1;34m"
-amarillo="\e[1;33m"
+verde="\e[32m"
+rojo="\e[31m"
+amarillo="\e[33m"
+azul="\e[36m"
 reset="\e[0m"
 
 # Obtener puerto
-get_port() {
-    if [ -f "$PORT_FILE" ]; then
-        cat $PORT_FILE
-    else
-        echo "80"
-    fi
-}
+if [ -f "$PORT_FILE" ]; then
+    PORT=$(cat $PORT_FILE)
+else
+    PORT="No definido"
+fi
 
-# Contar usuarios activos
+# Contador activos
 usuarios_activos() {
     HOY=$(date +%d%m%Y)
-    awk -F "|" -v hoy="$HOY" '$2 >= hoy {count++} END {print count+0}' $DB
+    COUNT=0
+
+    while IFS="|" read -r user exp pass limit used lock; do
+        if [[ "$exp" -ge "$HOY" ]]; then
+            ((COUNT++))
+        fi
+    done < "$DB"
+
+    echo "$COUNT"
 }
 
-# Listar usuarios
+# Listar usuarios enumerados
 listar_usuarios() {
-    echo -e "${azul}==== USUARIOS ====${reset}"
-    if [ ! -s "$DB" ]; then
-        echo "No hay usuarios"
-        return
-    fi
-
-    while IFS="|" read user exp; do
-        echo -e "👤 $user | Expira: $exp"
+    echo -e "${azul}==== USUARIOS ==== ${reset}"
+    i=1
+    while IFS="|" read -r user exp pass limit used lock; do
+        echo -e "$i) 👤 $user | Expira: $exp"
+        ((i++))
     done < "$DB"
 }
 
 # Crear usuario
 crear_usuario() {
+    echo -e "${verde}=== CREAR USUARIO ===${reset}"
     read -p "Usuario: " user
 
     if grep -q "^$user|" "$DB"; then
-        echo -e "${rojo}Usuario ya existe${reset}"
+        echo -e "${rojo}Ya existe${reset}"
+        sleep 1
         return
     fi
 
-    read -p "Días: " dias
+    read -p "Dias: " dias
+    read -p "Contraseña (opcional): " pass
 
     exp=$(date -d "+$dias days" +%d%m%Y)
 
-    echo "$user|$exp" >> $DB
+    echo "$user|$exp|$pass|1|0|0" >> "$DB"
 
-    echo -e "${verde}Usuario creado correctamente${reset}"
+    echo -e "${verde}Usuario creado ✔${reset}"
+    sleep 1
 }
 
 # Renovar usuario
 renovar_usuario() {
     listar_usuarios
-    echo ""
+    read -p "Numero de usuario: " num
 
-    read -p "Usuario a renovar: " user
+    linea=$(sed -n "${num}p" "$DB")
 
-    if ! grep -q "^$user|" "$DB"; then
-        echo -e "${rojo}No existe${reset}"
+    if [ -z "$linea" ]; then
+        echo -e "${rojo}Invalido${reset}"
+        sleep 1
         return
     fi
 
-    read -p "Días a agregar: " dias
+    user=$(echo "$linea" | cut -d'|' -f1)
 
-    exp_actual=$(grep "^$user|" "$DB" | cut -d "|" -f2)
-    nueva_fecha=$(date -d "${exp_actual} +$dias days" +%d%m%Y 2>/dev/null)
+    read -p "Dias a agregar: " dias
 
-    sed -i "s/^$user|.*/$user|$nueva_fecha/" $DB
+    nueva=$(date -d "+$dias days" +%d%m%Y)
 
-    echo -e "${verde}Renovado correctamente${reset}"
+    sed -i "${num}s|^[^|]*|$user|" "$DB"
+    sed -i "${num}s|^[^|]*|$user|; ${num}s|$user|$user|; ${num}s|[0-9]\{8\}|$nueva|" "$DB"
+
+    awk -F"|" -v n="$num" -v new="$nueva" 'BEGIN{OFS="|"} {if(NR==n){$2=new} print}' "$DB" > "$DB.tmp" && mv "$DB.tmp" "$DB"
+
+    echo -e "${verde}Renovado ✔${reset}"
+    sleep 1
 }
 
 # Eliminar usuario
 eliminar_usuario() {
     listar_usuarios
-    echo ""
+    read -p "Numero de usuario a eliminar: " num
 
-    read -p "Usuario a eliminar: " user
+    total=$(wc -l < "$DB")
 
-    if ! grep -q "^$user|" "$DB"; then
-        echo -e "${rojo}No existe${reset}"
+    if [ "$num" -gt "$total" ] || [ "$num" -le 0 ]; then
+        echo -e "${rojo}Invalido${reset}"
+        sleep 1
         return
     fi
 
-    sed -i "/^$user|/d" $DB
+    sed -i "${num}d" "$DB"
 
-    echo -e "${verde}Usuario eliminado${reset}"
+    echo -e "${rojo}Eliminado ✔${reset}"
+    sleep 1
 }
 
 # Cambiar puerto
 cambiar_puerto() {
     read -p "Nuevo puerto: " nuevo
 
-    if ! [[ "$nuevo" =~ ^[0-9]+$ ]]; then
-        echo -e "${rojo}Puerto inválido${reset}"
+    if [[ ! "$nuevo" =~ ^[0-9]+$ ]]; then
+        echo "Invalido"
+        sleep 1
         return
     fi
 
-    echo $nuevo > $PORT_FILE
-
     sed -i "s/Listen .*/Listen $nuevo/" /etc/apache2/ports.conf
-    sed -i "s/<VirtualHost \*:.*/<VirtualHost *:$nuevo>/" /etc/apache2/sites-enabled/000-default.conf
+    sed -i "s/<VirtualHost \*:.*/<VirtualHost \*:$nuevo>/" /etc/apache2/sites-enabled/000-default.conf
+
+    echo "$nuevo" > "$PORT_FILE"
 
     systemctl restart apache2
 
-    echo -e "${verde}Puerto cambiado a $nuevo${reset}"
+    echo -e "${verde}Puerto cambiado ✔${reset}"
+    sleep 1
 }
 
-# Menú principal
-menu() {
-    while true; do
-        clear
+# MENU
+while true; do
+    clear
+    echo -e "${azul}====== VPN MANAGER PRO ======${reset}"
+    echo -e "${verde}1) Crear usuario${reset}"
+    echo -e "${verde}2) Renovar usuario${reset}"
+    echo -e "${verde}3) Eliminar usuario${reset}"
+    echo -e "${verde}4) Listar usuarios${reset}"
+    echo -e "${verde}5) Usuarios activos: $(usuarios_activos)${reset}"
+    echo -e "${verde}6) Cambiar puerto API${reset}"
+    echo -e "${rojo}0) Salir${reset}"
+    echo "=================================="
+    echo -e "Puerto API: ${amarillo}$PORT${reset}"
+    echo "=================================="
 
-        PORT=$(get_port)
-        ACTIVOS=$(usuarios_activos)
+    read -p "Seleccione: " op
 
-        echo -e "${verde}====== VPN MANAGER PRO ======${reset}"
-        echo -e "1) Crear usuario"
-        echo -e "2) Renovar usuario"
-        echo -e "3) Eliminar usuario"
-        echo -e "4) Listar usuarios"
-        echo -e "5) Usuarios activos: ${amarillo}$ACTIVOS${reset}"
-        echo -e "6) Cambiar puerto API"
-        echo -e "0) Salir"
-        echo "=============================="
-        echo -e "Puerto API: ${azul}$PORT${reset}"
-        echo "=============================="
-
-        read -p "Seleccione: " op
-
-        case $op in
-            1) crear_usuario ;;
-            2) renovar_usuario ;;
-            3) eliminar_usuario ;;
-            4) listar_usuarios ;;
-            5) 
-                echo -e "${amarillo}Usuarios activos: $ACTIVOS${reset}"
-                read -p "Enter para continuar..."
-            ;;
-            6) cambiar_puerto ;;
-            0) exit ;;
-            *) echo "Opción inválida" ;;
-        esac
-
-        echo ""
-        read -p "Presiona Enter para continuar..."
-    done
-}
-
-menu
+    case $op in
+        1) crear_usuario ;;
+        2) renovar_usuario ;;
+        3) eliminar_usuario ;;
+        4) listar_usuarios; read -p "Enter para continuar..." ;;
+        5) read -p "Activos: $(usuarios_activos) | Enter..." ;;
+        6) cambiar_puerto ;;
+        0) exit ;;
+        *) echo "Opcion invalida"; sleep 1 ;;
+    esac
+done
 
