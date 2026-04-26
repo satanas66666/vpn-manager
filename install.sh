@@ -3,25 +3,34 @@
 clear
 echo "===== VPN MANAGER AUTO INSTALL ====="
 
-if [ "$(id -u)" != "0" ]; then
-   echo "Ejecuta como root"
-   exit 1
-fi
+[ "$(id -u)" != "0" ] && echo "Ejecuta como root" && exit
 
 BASE="/opt/vpnmanager"
 REPO="https://raw.githubusercontent.com/satanas66666/vpn-manager/main"
 
-read -p "Puerto para API (ej: 8080): " PORT
+read -p "Puerto API (ej: 7080): " PORT
 
-echo "Instalando dependencias..."
 apt update -y
 apt install apache2 wget -y
 
 a2enmod cgi
 
-echo "Configurando puerto..."
+# Configurar puerto correctamente
 sed -i "s/Listen 80/Listen $PORT/g" /etc/apache2/ports.conf
 sed -i "s/<VirtualHost \*:80>/<VirtualHost \*:$PORT>/g" /etc/apache2/sites-enabled/000-default.conf
+
+# Activar CGI en web root
+cat <<EOF >> /etc/apache2/sites-enabled/000-default.conf
+
+<Directory "/var/www/html">
+    Options +ExecCGI
+    AddHandler cgi-script .cgi .sh
+    Require all granted
+</Directory>
+
+ScriptAlias /checkUser /var/www/html/checkUser.cgi
+
+EOF
 
 timedatectl set-timezone America/Mexico_City
 
@@ -29,9 +38,7 @@ mkdir -p $BASE
 touch $BASE/usuarios.db
 chmod 777 $BASE/usuarios.db
 
-echo "$PORT" > $BASE/puerto.txt
-
-cd $BASE || exit
+cd $BASE
 
 wget -q -O manager.sh $REPO/manager.sh
 wget -q -O api_check.sh $REPO/api_check.sh
@@ -39,23 +46,23 @@ wget -q -O expire.sh $REPO/expire.sh
 
 chmod +x manager.sh api_check.sh expire.sh
 
-cp api_check.sh /usr/lib/cgi-bin/checkUser
-chmod +x /usr/lib/cgi-bin/checkUser
+# API directa sin /cgi-bin
+cp api_check.sh /var/www/html/checkUser.cgi
+chmod +x /var/www/html/checkUser.cgi
 
+# comando global
 echo -e "#!/bin/bash\nbash $BASE/manager.sh" > /usr/bin/checkuser
 chmod +x /usr/bin/checkuser
 
+# cron
 (crontab -l 2>/dev/null; echo "0 * * * * bash $BASE/expire.sh") | crontab -
 
 systemctl restart apache2
 
-IP=$(curl -s ifconfig.me)
-
-clear
-echo "=================================="
-echo " INSTALACIÓN COMPLETA ✅"
-echo "=================================="
-echo "Comando: checkuser"
-echo "API: http://$IP:$PORT/cgi-bin/checkUser"
-echo "=================================="
+echo "================================="
+echo " INSTALADO CORRECTAMENTE"
+echo "================================="
+echo "URL API:"
+echo "http://IP:$PORT/checkUser"
+echo "================================="
 
