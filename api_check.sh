@@ -3,34 +3,119 @@
 echo "Content-type: text/plain"
 echo ""
 
+export TZ="America/Mexico_City"
+
 DB="/opt/vpnmanager/usuarios.db"
+SESS="/opt/vpnmanager/sessions.db"
 
-read INPUT
-TOKEN=$(echo "$INPUT" | grep -oP '"user"\s*:\s*"\K[^"]+')
+mkdir -p /opt/vpnmanager
+touch $DB
+touch $SESS
 
-LINE=$(grep "^$TOKEN|" "$DB")
+# =========================
+# OBTENER IP REAL
+# =========================
 
-[ -z "$LINE" ] && echo "Not exist" && exit
+IP="$REMOTE_ADDR"
 
-USER=$(echo "$LINE" | cut -d'|' -f1)
-EXP=$(echo "$LINE" | cut -d'|' -f2)
-USED=$(echo "$LINE" | cut -d'|' -f3)
-LIMIT=$(echo "$LINE" | cut -d'|' -f4)
+# Evitar localhost o pruebas
+if [[ "$IP" == "127.0.0.1" ]]; then
+    echo "Test mode"
+    exit
+fi
+
+# =========================
+# DETECTAR NAVEGADOR
+# =========================
+
+UA="$HTTP_USER_AGENT"
+
+if echo "$UA" | grep -qiE "mozilla|chrome|safari"; then
+    echo "Access denied"
+    exit
+fi
+
+# =========================
+# OBTENER USUARIO
+# =========================
+
+if [ "$REQUEST_METHOD" = "GET" ]; then
+    USER=$(echo "$QUERY_STRING" | sed -n 's/^user=\([^&]*\).*$/\1/p')
+else
+    read INPUT
+    USER=$(echo "$INPUT" | grep -oP '"user"\s*:\s*"\K[^"]+')
+fi
+
+# Validar usuario
+if [[ ! "$USER" =~ ^[a-zA-Z0-9]+$ ]]; then
+    echo "Not exist"
+    exit
+fi
+
+# Buscar usuario
+LINE=$(grep "^$USER|" "$DB")
+
+if [ -z "$LINE" ]; then
+    echo "Not exist"
+    exit
+fi
+
+# =========================
+# DATOS
+# =========================
+
+EXP=$(echo "$LINE" | cut -d '|' -f2)
+LIMIT=$(echo "$LINE" | cut -d '|' -f3)
 
 HOY=$(date +%d%m%Y)
+NOW=$(date +%s)
 
+# Expirado
 if [ "$EXP" -lt "$HOY" ]; then
-echo "Not exist"
-exit
+    echo "Expired"
+    exit
 fi
 
-if [ "$USED" -ge "$LIMIT" ]; then
-echo "Limit reached"
-exit
+# =========================
+# LIMPIAR SESIONES VIEJAS (5 min)
+# =========================
+
+awk -v now="$NOW" '$3 > now {print}' $SESS > $SESS.tmp && mv $SESS.tmp $SESS
+
+# =========================
+# CONTAR SESIONES ACTIVAS DEL USER
+# =========================
+
+ACTIVE=$(grep "^$USER|" $SESS | wc -l)
+
+# =========================
+# VERIFICAR SI IP YA EXISTE
+# =========================
+
+EXIST=$(grep "^$USER|$IP|" $SESS)
+
+if [ -n "$EXIST" ]; then
+    # renovar sesión
+    EXP_TIME=$((NOW + 300))
+    sed -i "s|^$USER|$IP|.*|$USER|$IP|$EXP_TIME|" $SESS
+    echo "$EXP"
+    exit
 fi
 
-NEW=$((USED+1))
-sed -i "s/^$USER|.*/$USER|$EXP|$NEW|$LIMIT/" $DB
+# =========================
+# VALIDAR LIMITE
+# =========================
+
+if [ "$ACTIVE" -ge "$LIMIT" ]; then
+    echo "Limit reached"
+    exit
+fi
+
+# =========================
+# AGREGAR SESIÓN
+# =========================
+
+EXP_TIME=$((NOW + 300))
+echo "$USER|$IP|$EXP_TIME" >> $SESS
 
 echo "$EXP"
-
