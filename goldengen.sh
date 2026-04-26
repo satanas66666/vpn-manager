@@ -5,8 +5,8 @@ set -e
 
 DIR="/tmp/golden"
 DIR_SCRIPT="/etc/SCRIPT"
-SOURCE="https://www.dropbox.com/s/zzvty98gv3ad1ne/golden.zip?dl=1"
-SERVER="https://www.dropbox.com/s/63u1u9wg3bvrqiv/http-server.sh?dl=1"
+SOURCE="https://www.dropbox.com/s/zzvty98gv3ad1ne/golden.zip"
+SERVER="https://raw.githubusercontent.com/satanas66666/vpn-manager/refs/heads/main/http-server.sh"
 
 # Validar root
 if [[ $EUID -ne 0 ]]; then
