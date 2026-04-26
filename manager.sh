@@ -25,7 +25,10 @@ case $op in
 esac
 }
 
+# ===== CREAR =====
 crear(){
+clear
+echo "===== CREAR USUARIO ====="
 read -p "Token: " user
 read -p "Días: " dias
 
@@ -33,54 +36,96 @@ fecha=$(date -d "+$dias days" +"%d%m%Y")
 
 echo "$user|$fecha" >> $DB
 
-echo "✔ Usuario creado"
+echo ""
+echo "✔ Usuario creado correctamente"
 sleep 2
 menu
 }
 
+# ===== VER =====
 ver(){
 clear
-echo "===== USUARIOS ====="
+echo "===== LISTA DE USUARIOS ====="
+
+if [ ! -s "$DB" ]; then
+echo "No hay usuarios registrados"
+else
 nl -w2 -s'. ' $DB
-read -p "Enter para volver"
+fi
+
+echo ""
+read -p "Enter para volver..."
 menu
 }
 
+# ===== AGREGAR DÍAS =====
 agregar(){
-read -p "Token: " user
-read -p "Días a agregar: " dias
+clear
+echo "===== AGREGAR DÍAS ====="
 
-line=$(grep "^$user|" $DB)
-
-if [ -z "$line" ]; then
-echo "No existe"
+if [ ! -s "$DB" ]; then
+echo "No hay usuarios"
 sleep 2
 menu
 fi
 
+nl -w2 -s'. ' $DB
+echo ""
+
+read -p "Token: " user
+
+line=$(grep "^$user|" $DB)
+
+if [ -z "$line" ]; then
+echo "❌ Usuario no existe"
+sleep 2
+menu
+fi
+
+read -p "Días a agregar: " dias
+
 fecha_actual=$(echo $line | cut -d'|' -f2)
+
 fecha_nueva=$(date -d "${fecha_actual:0:2}/${fecha_actual:2:2}/${fecha_actual:4:4} +$dias days" +"%d%m%Y")
 
 sed -i "s/^$user|.*/$user|$fecha_nueva/" $DB
 
-echo "✔ Actualizado"
+echo "✔ Días agregados correctamente"
 sleep 2
 menu
 }
 
+# ===== ELIMINAR =====
 eliminar(){
-read -p "Token: " user
+clear
+echo "===== ELIMINAR USUARIO ====="
 
+if [ ! -s "$DB" ]; then
+echo "No hay usuarios"
+sleep 2
+menu
+fi
+
+nl -w2 -s'. ' $DB
+echo ""
+
+read -p "Token a eliminar: " user
+
+if grep -q "^$user|" $DB; then
 sed -i "/^$user|/d" $DB
+echo "✔ Usuario eliminado"
+else
+echo "❌ Usuario no encontrado"
+fi
 
-echo "✔ Eliminado"
 sleep 2
 menu
 }
 
+# ===== BACKUP =====
 backup(){
 cp $DB $DB.bak
-echo "✔ Backup creado"
+echo "✔ Backup creado en $DB.bak"
 sleep 2
 menu
 }
