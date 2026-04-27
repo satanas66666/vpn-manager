@@ -1,93 +1,147 @@
 #!/bin/bash
 
-clear
-echo "===== VPN MANAGER AUTO INSTALL PRO ====="
+echo "🚀 Instalando sistema PRO VPN..."
 
-BASE="/opt/vpnmanager"
-REPO="https://raw.githubusercontent.com/satanas66666/vpn-manager/main"
+# =========================
+# CREAR DIRECTORIOS
+# =========================
+mkdir -p /etc/SSHPlus/limits
+mkdir -p /etc/SSHPlus/blocked
+mkdir -p /etc/SSHPlus/abuse
 
-read -p "Puerto API (ej: 8090): " PORT
+chmod -R 777 /etc/SSHPlus
 
-echo "Instalando dependencias..."
-apt update -y
-apt install apache2 -y
-
-a2enmod cgi rewrite
-
-echo "Configurando puerto..."
-sed -i "s/80/$PORT/g" /etc/apache2/ports.conf
-sed -i "s/<VirtualHost \*:80>/<VirtualHost \*:$PORT>/g" /etc/apache2/sites-enabled/000-default.conf
-
-echo "Configurando zona horaria México..."
-timedatectl set-timezone America/Mexico_City
-
-echo "Creando base..."
-mkdir -p $BASE
-touch $BASE/usuarios.db
-chmod 777 $BASE/usuarios.db
-
-cd $BASE
-
-echo "Descargando scripts..."
-wget -O manager.sh $REPO/manager.sh
-wget -O api_check.sh $REPO/api_check.sh
-wget -O expire.sh $REPO/expire.sh
-
-chmod +x *.sh
-
-echo "Instalando API limpia..."
-
-cat > /usr/lib/cgi-bin/checkUser <<'EOF'
+# =========================
+# SCRIPT LIMITADOR PRO
+# =========================
+cat > /root/limit_pro.sh << 'EOF'
 #!/bin/bash
 
-echo "Content-type: text/plain"
-echo ""
+LIMIT_DIR="/etc/SSHPlus/limits"
+BLOCK_DIR="/etc/SSHPlus/blocked"
+ABUSE_DIR="/etc/SSHPlus/abuse"
 
-read INPUT
-USER=$(echo $INPUT | grep -oP '"user":"\K[^"]+')
+mkdir -p $BLOCK_DIR
+mkdir -p $ABUSE_DIR
 
-DB="/opt/vpnmanager/usuarios.db"
+MAX_ABUSE=3
 
-LINE=$(grep "^$USER|" $DB)
+for user in $(ls $LIMIT_DIR 2>/dev/null); do
 
-if [ -z "$LINE" ]; then
-    echo "Not exist"
-else
-    FECHA=$(echo $LINE | cut -d'|' -f2)
-    echo "$FECHA"
-fi
+    id "$user" &>/dev/null || continue
+
+    LIMIT=$(cat $LIMIT_DIR/$user 2>/dev/null)
+    [[ -z "$LIMIT" || "$LIMIT" -le 0 ]] && continue
+
+    PIDS=$(ps -ef | grep "$user" | grep -E 'sshd|dropbear' | grep -v grep | awk '{print $2}')
+    COUNT=$(echo "$PIDS" | grep -c .)
+
+    if [ "$COUNT" -gt "$LIMIT" ]; then
+
+        FILE="$ABUSE_DIR/$user"
+
+        if [ ! -f "$FILE" ]; then
+            echo 1 > $FILE
+        else
+            NUM=$(cat $FILE)
+            NUM=$((NUM + 1))
+            echo $NUM > $FILE
+        fi
+
+        ABUSE=$(cat $FILE)
+
+        if [ "$ABUSE" -ge "$MAX_ABUSE" ]; then
+            echo "blocked" > $BLOCK_DIR/$user
+            passwd -l $user 2>/dev/null
+        fi
+
+        TO_KILL=$(ps -ef | grep "$user" | grep -E 'sshd|dropbear' | grep -v grep \
+            | awk '{print $2}' | tail -n +$(($LIMIT + 1)))
+
+        for pid in $TO_KILL; do
+            kill -9 $pid 2>/dev/null
+        done
+
+    fi
+
+done
 EOF
 
-chmod +x /usr/lib/cgi-bin/checkUser
+chmod +x /root/limit_pro.sh
 
-echo "Activando URL limpia /checkUser..."
+# =========================
+# SCRIPT ELIMINAR EXPIRADOS
+# =========================
+cat > /root/expire_clean.sh << 'EOF'
+#!/bin/bash
 
-cat >> /etc/apache2/sites-enabled/000-default.conf <<EOF
+LIMIT_DIR="/etc/SSHPlus/limits"
+BLOCK_DIR="/etc/SSHPlus/blocked"
+ABUSE_DIR="/etc/SSHPlus/abuse"
 
-ScriptAlias /checkUser /usr/lib/cgi-bin/checkUser
+for user in $(awk -F: '$3>=1000 {print $1}' /etc/passwd); do
 
-<Directory "/usr/lib/cgi-bin">
-    AllowOverride None
-    Options +ExecCGI
-    Require all granted
-</Directory>
+    id "$user" &>/dev/null || continue
+
+    EXPIRE=$(chage -l $user 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
+
+    [[ "$EXPIRE" == "never" || -z "$EXPIRE" ]] && continue
+
+    EXPIRE_DATE=$(date -d "$EXPIRE" +%s 2>/dev/null)
+    TODAY=$(date +%s)
+
+    if [ "$TODAY" -ge "$EXPIRE_DATE" ]; then
+
+        userdel $user 2>/dev/null
+
+        rm -f $LIMIT_DIR/$user
+        rm -f $BLOCK_DIR/$user
+        rm -f $ABUSE_DIR/$user
+
+        echo "$(date) - Usuario eliminado: $user" >> /var/log/expire.log
+    fi
+
+done
 EOF
 
-echo "Creando comando global..."
-echo -e "#!/bin/bash\nbash $BASE/manager.sh" > /usr/bin/checkuser
-chmod +x /usr/bin/checkuser
+chmod +x /root/expire_clean.sh
 
-echo "Configurando auto-expiración..."
-(crontab -l 2>/dev/null; echo "0 * * * * bash $BASE/expire.sh") | crontab -
+# =========================
+# CONFIGURAR CRON LIMPIO
+# =========================
 
-echo "Abriendo puerto..."
-ufw allow $PORT/tcp 2>/dev/null
+crontab -l 2>/dev/null | grep -v 'limit_pro.sh' | grep -v 'expire_clean.sh' > /tmp/cronvpn
 
-systemctl restart apache2
+echo "* * * * * /root/limit_pro.sh" >> /tmp/cronvpn
+echo "*/5 * * * * /root/expire_clean.sh" >> /tmp/cronvpn
 
+crontab /tmp/cronvpn
+rm -f /tmp/cronvpn
+
+# =========================
+# PERMISOS EXTRA
+# =========================
+chmod +x /root/*.sh
+
+# =========================
+# FINAL
+# =========================
 echo ""
-echo "===== INSTALADO CORRECTAMENTE ====="
-echo "Comando: checkuser"
-echo "API lista en:"
-echo "http://IP:$PORT/checkUser"
+echo "✅ INSTALACIÓN COMPLETADA"
+echo "━━━━━━━━━━━━━━━━━━━━━━"
+echo "✔ Anti multi-login activo"
+echo "✔ Límite por usuario activo"
+echo "✔ Bloqueo automático activo"
+echo "✔ Auto eliminación por fecha activo"
+echo "✔ Sistema anti-abuso activo"
+echo ""
+echo "📂 Rutas:"
+echo "Limits:   /etc/SSHPlus/limits"
+echo "Blocked:  /etc/SSHPlus/blocked"
+echo "Abuse:    /etc/SSHPlus/abuse"
+echo ""
+echo "📄 Logs:"
+echo "/var/log/expire.log"
+echo ""
+echo "🔥 VPS PRO LISTO 🚀"
 
