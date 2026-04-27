@@ -30,12 +30,19 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
 
     id "$user" &>/dev/null || continue
 
+    # 🚫 SI ESTA BLOQUEADO → MATAR TODO
+    if [ -f "$BLOCK_DIR/$user" ]; then
+        pkill -KILL -u $user 2>/dev/null
+        pkill -f $user 2>/dev/null
+        continue
+    fi
+
     LIMIT=$(cat $LIMIT_DIR/$user 2>/dev/null)
     [[ -z "$LIMIT" || "$LIMIT" -le 0 ]] && continue
 
-    # 🔥 FIX: procesos reales del usuario
+    # 🔥 PROCESOS REALES
     PIDS=$(ps -u $user -o pid=,comm= | grep -E 'sshd|dropbear' | awk '{print $1}')
-    COUNT=$(echo "$PIDS" | wc -l)
+    COUNT=$(echo "$PIDS" | grep -c .)
 
     if [ "$COUNT" -gt "$LIMIT" ]; then
 
@@ -53,10 +60,16 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
 
         if [ "$ABUSE" -ge "$MAX_ABUSE" ]; then
             echo "blocked" > $BLOCK_DIR/$user
-            passwd -l $user 2>/dev/null
+
+            # 🔒 BLOQUEO FUERTE
+            usermod -L $user 2>/dev/null
+            usermod -s /usr/sbin/nologin $user 2>/dev/null
+
+            # 💣 MATAR TODO
+            pkill -KILL -u $user 2>/dev/null
         fi
 
-        # 🔥 FIX: evitar falsos positivos
+        # 🔥 MATAR EXCESOS
         TO_KILL=$(ps -u $user -o pid=,comm= | grep -E 'sshd|dropbear' \
             | awk '{print $1}' | tail -n +$(($LIMIT + 1)))
 
@@ -94,10 +107,11 @@ for user in $(awk -F: '$3>=1000 {print $1}' /etc/passwd); do
 
     if [ "$TODAY" -ge "$EXPIRE_DATE" ]; then
 
-        # 🔥 FIX: matar sesiones activas
-        pkill -u $user 2>/dev/null
+        # 💣 MATAR TODO
+        pkill -KILL -u $user 2>/dev/null
+        killall -u $user 2>/dev/null
 
-        # 🔥 FIX: forzar eliminación
+        # 🔥 ELIMINAR FORZADO
         userdel -f $user 2>/dev/null
 
         rm -f $LIMIT_DIR/$user
@@ -115,7 +129,6 @@ chmod +x /root/expire_clean.sh
 # =========================
 # CONFIGURAR CRON LIMPIO
 # =========================
-
 crontab -l 2>/dev/null | grep -v 'limit_pro.sh' | grep -v 'expire_clean.sh' > /tmp/cronvpn
 
 echo "* * * * * /root/limit_pro.sh" >> /tmp/cronvpn
