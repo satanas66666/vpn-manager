@@ -33,8 +33,9 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
     LIMIT=$(cat $LIMIT_DIR/$user 2>/dev/null)
     [[ -z "$LIMIT" || "$LIMIT" -le 0 ]] && continue
 
-    PIDS=$(ps -ef | grep "$user" | grep -E 'sshd|dropbear' | grep -v grep | awk '{print $2}')
-    COUNT=$(echo "$PIDS" | grep -c .)
+    # 🔥 FIX: procesos reales del usuario
+    PIDS=$(ps -u $user -o pid=,comm= | grep -E 'sshd|dropbear' | awk '{print $1}')
+    COUNT=$(echo "$PIDS" | wc -l)
 
     if [ "$COUNT" -gt "$LIMIT" ]; then
 
@@ -55,8 +56,9 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
             passwd -l $user 2>/dev/null
         fi
 
-        TO_KILL=$(ps -ef | grep "$user" | grep -E 'sshd|dropbear' | grep -v grep \
-            | awk '{print $2}' | tail -n +$(($LIMIT + 1)))
+        # 🔥 FIX: evitar falsos positivos
+        TO_KILL=$(ps -u $user -o pid=,comm= | grep -E 'sshd|dropbear' \
+            | awk '{print $1}' | tail -n +$(($LIMIT + 1)))
 
         for pid in $TO_KILL; do
             kill -9 $pid 2>/dev/null
@@ -92,7 +94,11 @@ for user in $(awk -F: '$3>=1000 {print $1}' /etc/passwd); do
 
     if [ "$TODAY" -ge "$EXPIRE_DATE" ]; then
 
-        userdel $user 2>/dev/null
+        # 🔥 FIX: matar sesiones activas
+        pkill -u $user 2>/dev/null
+
+        # 🔥 FIX: forzar eliminación
+        userdel -f $user 2>/dev/null
 
         rm -f $LIMIT_DIR/$user
         rm -f $BLOCK_DIR/$user
