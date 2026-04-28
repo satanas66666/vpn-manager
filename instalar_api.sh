@@ -66,102 +66,88 @@ if (in_array(\$accion, ["crear","eliminar","bloquear","desbloquear","editar","re
 switch ($accion) {
 
     case "crear":
-
-        // Crear usuario si no existe
         run("id $user || useradd -M -s /bin/false $user");
-
-        // Password global
         run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
 
-        // Expiración consistente
-        if ($dias > 0) {
+        // 🔥 PRIORIDAD: usar fecha del panel
+        if (!empty($fecha)) {
+            run("chage -E $fecha $user");
+        } elseif ($dias > 0) {
+            // fallback (solo si no mandas fecha)
             run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
         }
-
-        // Limite sincronizado
-        if (!file_exists("/etc/SSHPlus/limits")) {
-            mkdir("/etc/SSHPlus/limits", 0777, true);
-        }
-        file_put_contents("/etc/SSHPlus/limits/$user", 3);
-
     break;
-
 
     case "eliminar":
-
-        // Matar sesiones SIEMPRE
         run("pkill -KILL -u $user");
         run("killall -u $user");
-
-        // Eliminar usuario
         run("userdel -f $user");
-
-        // Limpiar TODO
         @unlink("/etc/SSHPlus/limits/$user");
         @unlink("/etc/SSHPlus/blocked/$user");
-        @unlink("/etc/SSHPlus/abuse/$user");
-
     break;
-
 
     case "bloquear":
-
-        // Bloqueo fuerte real
         run("usermod -L $user");
-        run("usermod -s /usr/sbin/nologin $user");
-
-        // Matar sesiones activas
+        run("usermod -s /bin/false $user");
         run("pkill -KILL -u $user");
-        run("killall -u $user");
-
-        // Marcar bloqueado
-        if (!file_exists("/etc/SSHPlus/blocked")) {
-            mkdir("/etc/SSHPlus/blocked", 0777, true);
-        }
         file_put_contents("/etc/SSHPlus/blocked/$user", "blocked");
-
     break;
-
 
     case "desbloquear":
-
-        // Restaurar acceso real
         run("usermod -U $user");
         run("usermod -s /bin/bash $user");
-
-        // Limpiar bloqueos
         @unlink("/etc/SSHPlus/blocked/$user");
-        @unlink("/etc/SSHPlus/abuse/$user");
-
     break;
-
 
     case "editar":
 
-        // Actualizar expiración por días
-        if ($dias > 0) {
-            run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
+    // =========================
+    // 🔥 SUMAR DÍAS (IGUAL QUE PANEL)
+    // =========================
+    if ($dias > 0) {
+
+        $raw = run("chage -l $user | grep 'Account expires'");
+        $fecha_actual = "";
+
+        if ($raw) {
+            $parts = explode(":", $raw);
+            $fecha_actual = trim($parts[1]);
         }
 
-        // O por fecha directa
-        if (!empty($fecha)) {
-            run("chage -E $fecha $user");
+        // Si no tiene fecha o es never → usar hoy
+        if ($fecha_actual == "" || strtolower($fecha_actual) == "never") {
+            $base = time();
+        } else {
+            $base = strtotime($fecha_actual);
         }
 
-    break;
+        // Si ya expiró → empezar desde hoy
+        if ($base < time()) {
+            $base = time();
+        }
 
+        // Sumar días correctamente
+        $nueva_fecha = strtotime("+$dias days", $base);
+        $formato = date("Y-m-d", $nueva_fecha);
+
+        run("chage -E $formato $user");
+    }
+
+    // =========================
+    // 🔥 FECHA EXACTA (SOBRESCRIBE)
+    // =========================
+    if (!empty($fecha)) {
+
+        run("chage -E $fecha $user");
+    }
+
+break;
 
     case "reset":
-
-        // Reset password
         run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
-
-        // Opcional: matar sesiones para forzar reconexión
-        run("pkill -KILL -u $user");
-
     break;
-
-
+    
+        // 🔥 👉 AQUI EXACTAMENTE 👇
     case "limpiar_expirados":
 
         $users = explode("\n", trim(shell_exec("awk -F: '$3>=1000 {print $1}' /etc/passwd")));
@@ -170,12 +156,25 @@ switch ($accion) {
 
             if (empty($u)) continue;
 
-            $expire = trim(shell_exec("chage -l $u | grep 'Account expires' | cut -d: -f2"));
+            // 🚫 NO ELIMINAR SI ESTA BLOQUEADO
+            if (file_exists("/etc/SSHPlus/blocked/$u")) {
+                continue;
+            }
+
+            $expire_raw = shell_exec("chage -l $u 2>/dev/null | grep 'Account expires'");
+            $expire = "";
+
+            if ($expire_raw) {
+                $parts = explode(":", $expire_raw);
+                $expire = trim($parts[1]);
+            }
 
             if ($expire == "never" || empty($expire)) continue;
 
             $exp_date = strtotime($expire);
             $today = time();
+
+            if (!$exp_date) continue;
 
             if ($today >= $exp_date) {
 
@@ -192,7 +191,7 @@ switch ($accion) {
         echo "cleaned";
 
     break;
-
+    // 🔥 👉 FIN
 
     default:
         exit("Acción inválida");
