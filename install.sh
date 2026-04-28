@@ -1,5 +1,33 @@
 #!/bin/bash
 
+echo "🧹 Limpiando instalación anterior..."
+
+# =========================
+# LIMPIAR CRON ANTERIOR
+# =========================
+crontab -l 2>/dev/null | grep -v 'limit_pro.sh' | grep -v 'expire_clean.sh' > /tmp/cronvpn
+crontab /tmp/cronvpn
+rm -f /tmp/cronvpn
+
+# =========================
+# MATAR PROCESOS ANTERIORES
+# =========================
+pkill -f limit_pro.sh 2>/dev/null
+pkill -f expire_clean.sh 2>/dev/null
+
+# =========================
+# ELIMINAR SCRIPTS VIEJOS
+# =========================
+rm -f /root/limit_pro.sh
+rm -f /root/expire_clean.sh
+
+# =========================
+# LIMPIAR CONFIG (NO BORRA USUARIOS)
+# =========================
+rm -rf /etc/SSHPlus/limits/*
+rm -rf /etc/SSHPlus/blocked/*
+rm -rf /etc/SSHPlus/abuse/*
+
 echo "🚀 Instalando sistema PRO VPN..."
 
 # =========================
@@ -128,9 +156,7 @@ chmod +x /root/expire_clean.sh
 # =========================
 # CONFIGURAR CRON LIMPIO
 # =========================
-crontab -l 2>/dev/null | grep -v 'limit_pro.sh' | grep -v 'expire_clean.sh' > /tmp/cronvpn
-
-echo "* * * * * /root/limit_pro.sh" >> /tmp/cronvpn
+echo "* * * * * /root/limit_pro.sh" > /tmp/cronvpn
 echo "*/5 * * * * /root/expire_clean.sh" >> /tmp/cronvpn
 
 crontab /tmp/cronvpn
@@ -145,8 +171,9 @@ chmod +x /root/*.sh
 # FINAL
 # =========================
 echo ""
-echo "✅ INSTALACIÓN COMPLETADA"
+echo "✅ INSTALACIÓN COMPLETA Y LIMPIA"
 echo "━━━━━━━━━━━━━━━━━━━━━━"
+echo "✔ Sistema reiniciado sin errores"
 echo "✔ Anti multi-login activo"
 echo "✔ Límite por usuario activo"
 echo "✔ Bloqueo automático activo"
@@ -162,3 +189,4 @@ echo "📄 Logs:"
 echo "/var/log/expire.log"
 echo ""
 echo "🔥 VPS PRO LISTO 🚀"
+
