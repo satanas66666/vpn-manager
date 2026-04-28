@@ -90,6 +90,7 @@ switch (\$accion) {
         run("usermod -U \$user");
         run("usermod -s /bin/bash \$user");
         @unlink("/etc/SSHPlus/blocked/\$user");
+        @unlink("/etc/SSHPlus/abuse/$user");
     break;
 
     case "editar":
