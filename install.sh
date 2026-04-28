@@ -33,7 +33,6 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
     # 🚫 SI ESTA BLOQUEADO → MATAR TODO
     if [ -f "$BLOCK_DIR/$user" ]; then
         pkill -KILL -u $user 2>/dev/null
-        pkill -f $user 2>/dev/null
         continue
     fi
 
@@ -61,9 +60,9 @@ for user in $(ls $LIMIT_DIR 2>/dev/null); do
         if [ "$ABUSE" -ge "$MAX_ABUSE" ]; then
             echo "blocked" > $BLOCK_DIR/$user
 
-            # 🔒 BLOQUEO FUERTE
+            # 🔒 BLOQUEO FUERTE (CORREGIDO)
             usermod -L $user 2>/dev/null
-            usermod -s /usr/sbin/nologin $user 2>/dev/null
+            usermod -s /bin/false $user 2>/dev/null
 
             # 💣 MATAR TODO
             pkill -KILL -u $user 2>/dev/null
@@ -163,4 +162,3 @@ echo "📄 Logs:"
 echo "/var/log/expire.log"
 echo ""
 echo "🔥 VPS PRO LISTO 🚀"
-
