@@ -63,48 +63,136 @@ if (in_array(\$accion, ["crear","eliminar","bloquear","desbloquear","editar","re
     exit("Usuario inválido");
 }
 
-switch (\$accion) {
+switch ($accion) {
 
     case "crear":
-        run("id \$user || useradd -M -s /bin/false \$user");
-        run("echo " . escapeshellarg(\$user . ":" . \$pass) . " | chpasswd");
-        run("chage -E \$(date -d '+\$dias days' +%Y-%m-%d) \$user");
+
+        // Crear usuario si no existe
+        run("id $user || useradd -M -s /bin/false $user");
+
+        // Password global
+        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+
+        // Expiración consistente
+        if ($dias > 0) {
+            run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
+        }
+
+        // Limite sincronizado
+        if (!file_exists("/etc/SSHPlus/limits")) {
+            mkdir("/etc/SSHPlus/limits", 0777, true);
+        }
+        file_put_contents("/etc/SSHPlus/limits/$user", 3);
+
     break;
+
 
     case "eliminar":
-        run("pkill -u \$user");
-        run("killall -u \$user");
-        run("userdel -f \$user");
-        @unlink("/etc/SSHPlus/limits/\$user");
-        @unlink("/etc/SSHPlus/blocked/\$user");
+
+        // Matar sesiones SIEMPRE
+        run("pkill -KILL -u $user");
+        run("killall -u $user");
+
+        // Eliminar usuario
+        run("userdel -f $user");
+
+        // Limpiar TODO
+        @unlink("/etc/SSHPlus/limits/$user");
+        @unlink("/etc/SSHPlus/blocked/$user");
+        @unlink("/etc/SSHPlus/abuse/$user");
+
     break;
+
 
     case "bloquear":
-        run("usermod -L \$user");
-        run("usermod -s /bin/false \$user");
-        run("pkill -KILL -u \$user");
-        file_put_contents("/etc/SSHPlus/blocked/\$user", "blocked");
+
+        // Bloqueo fuerte real
+        run("usermod -L $user");
+        run("usermod -s /usr/sbin/nologin $user");
+
+        // Matar sesiones activas
+        run("pkill -KILL -u $user");
+        run("killall -u $user");
+
+        // Marcar bloqueado
+        if (!file_exists("/etc/SSHPlus/blocked")) {
+            mkdir("/etc/SSHPlus/blocked", 0777, true);
+        }
+        file_put_contents("/etc/SSHPlus/blocked/$user", "blocked");
+
     break;
+
 
     case "desbloquear":
-        run("usermod -U \$user");
-        run("usermod -s /bin/bash \$user");
-        @unlink("/etc/SSHPlus/blocked/\$user");
+
+        // Restaurar acceso real
+        run("usermod -U $user");
+        run("usermod -s /bin/bash $user");
+
+        // Limpiar bloqueos
+        @unlink("/etc/SSHPlus/blocked/$user");
         @unlink("/etc/SSHPlus/abuse/$user");
+
     break;
+
 
     case "editar":
-        if (\$dias > 0) {
-            run("chage -E \$(date -d '+\$dias days' +%Y-%m-%d) \$user");
+
+        // Actualizar expiración por días
+        if ($dias > 0) {
+            run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
         }
-        if (!empty(\$fecha)) {
-            run("chage -E \$fecha \$user");
+
+        // O por fecha directa
+        if (!empty($fecha)) {
+            run("chage -E $fecha $user");
         }
+
     break;
 
+
     case "reset":
-        run("echo " . escapeshellarg(\$user . ":" . \$pass) . " | chpasswd");
+
+        // Reset password
+        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+
+        // Opcional: matar sesiones para forzar reconexión
+        run("pkill -KILL -u $user");
+
     break;
+
+
+    case "limpiar_expirados":
+
+        $users = explode("\n", trim(shell_exec("awk -F: '$3>=1000 {print $1}' /etc/passwd")));
+
+        foreach ($users as $u) {
+
+            if (empty($u)) continue;
+
+            $expire = trim(shell_exec("chage -l $u | grep 'Account expires' | cut -d: -f2"));
+
+            if ($expire == "never" || empty($expire)) continue;
+
+            $exp_date = strtotime($expire);
+            $today = time();
+
+            if ($today >= $exp_date) {
+
+                run("pkill -KILL -u $u");
+                run("killall -u $u");
+                run("userdel -f $u");
+
+                @unlink("/etc/SSHPlus/limits/$u");
+                @unlink("/etc/SSHPlus/blocked/$u");
+                @unlink("/etc/SSHPlus/abuse/$u");
+            }
+        }
+
+        echo "cleaned";
+
+    break;
+
 
     default:
         exit("Acción inválida");
@@ -176,4 +264,5 @@ echo "🌐 http://IP_VPS:$PUERTO/api.php"
 echo ""
 echo "👉 Prueba:"
 echo "curl http://127.0.0.1:$PUERTO/api.php"
+
 
