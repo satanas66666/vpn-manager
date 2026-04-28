@@ -11,92 +11,98 @@ SERVICIO="api-vps"
 TOKEN="ULTRA_SECRET_TOKEN"
 
 # =========================
-# LIMPIAR SERVICIOS ANTERIORES
+# LIMPIAR
 # =========================
 systemctl stop $SERVICIO 2>/dev/null
 systemctl disable $SERVICIO 2>/dev/null
 pkill -f "php -S" 2>/dev/null
 
 # =========================
-# CREAR DIRECTORIO
+# CREAR DIRECTORIOS
 # =========================
 mkdir -p $RUTA
+mkdir -p /etc/SSHPlus/blocked
+mkdir -p /etc/SSHPlus/limits
 
 # =========================
 # CREAR API
 # =========================
-cat > $RUTA/api.php <<'EOF'
+cat > $RUTA/api.php <<EOF
 <?php
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+if (\$_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo "API ONLINE ✅";
     exit;
 }
 
-$TOKEN = "ULTRA_SECRET_TOKEN";
+\$TOKEN = "$TOKEN";
 
-$data = json_decode(file_get_contents("php://input"), true);
+\$data = json_decode(file_get_contents("php://input"), true);
 
-if (!$data) {
+if (!\$data) {
     http_response_code(400);
     exit("JSON inválido");
 }
 
-if (!isset($data['token']) || $data['token'] !== $TOKEN) {
+if (!isset(\$data['token']) || \$data['token'] !== \$TOKEN) {
     http_response_code(403);
     exit("No autorizado");
 }
 
-$user  = preg_replace('/[^a-zA-Z0-9]/', '', $data['user'] ?? '');
-$pass  = $data['pass'] ?? '';
-$dias  = intval($data['dias'] ?? 0);
-$accion = $data['accion'] ?? '';
-$fecha = $data['fecha'] ?? '';
+\$user  = preg_replace('/[^a-zA-Z0-9]/', '', \$data['user'] ?? '');
+\$pass  = \$data['pass'] ?? '';
+\$dias  = intval(\$data['dias'] ?? 0);
+\$accion = \$data['accion'] ?? '';
+\$fecha = \$data['fecha'] ?? '';
 
-function run($cmd){
-    return shell_exec($cmd . " 2>/dev/null");
+function run(\$cmd){
+    return shell_exec("sudo \$cmd 2>&1");
 }
 
-if (in_array($accion, ["crear","eliminar","bloquear","desbloquear","editar","reset"]) && empty($user)) {
+if (in_array(\$accion, ["crear","eliminar","bloquear","desbloquear","editar","reset"]) && empty(\$user)) {
     exit("Usuario inválido");
 }
 
-switch ($accion) {
+switch (\$accion) {
 
     case "crear":
-        run("id $user || useradd -M -s /bin/false $user");
-        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
-        run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
+        run("id \$user || useradd -M -s /bin/false \$user");
+        run("echo " . escapeshellarg(\$user . ":" . \$pass) . " | chpasswd");
+        run("chage -E \$(date -d '+\$dias days' +%Y-%m-%d) \$user");
     break;
 
     case "eliminar":
-        run("pkill -u $user");
-        run("killall -u $user");
-        run("userdel -f $user");
+        run("pkill -u \$user");
+        run("killall -u \$user");
+        run("userdel -f \$user");
+        @unlink("/etc/SSHPlus/limits/\$user");
+        @unlink("/etc/SSHPlus/blocked/\$user");
     break;
 
     case "bloquear":
-        run("usermod -L $user");
-        run("usermod -s /usr/sbin/nologin $user");
-        run("pkill -KILL -u $user");
+        run("usermod -L \$user");
+        run("usermod -s /bin/false \$user");
+        run("pkill -KILL -u \$user");
+        file_put_contents("/etc/SSHPlus/blocked/\$user", "blocked");
     break;
 
     case "desbloquear":
-        run("usermod -U $user");
-        run("usermod -s /bin/bash $user");
+        run("usermod -U \$user");
+        run("usermod -s /bin/bash \$user");
+        @unlink("/etc/SSHPlus/blocked/\$user");
     break;
 
     case "editar":
-        if ($dias > 0) {
-            run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
+        if (\$dias > 0) {
+            run("chage -E \$(date -d '+\$dias days' +%Y-%m-%d) \$user");
         }
-        if (!empty($fecha)) {
-            run("chage -E $fecha $user");
+        if (!empty(\$fecha)) {
+            run("chage -E \$fecha \$user");
         }
     break;
 
     case "reset":
-        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+        run("echo " . escapeshellarg(\$user . ":" . \$pass) . " | chpasswd");
     break;
 
     default:
@@ -125,6 +131,13 @@ EOF
 # PERMISOS
 # =========================
 chmod -R 755 $RUTA
+
+# =========================
+# SUDO SIN PASSWORD
+# =========================
+if ! grep -q "www-data ALL=(ALL) NOPASSWD: ALL" /etc/sudoers; then
+    echo "www-data ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+fi
 
 # =========================
 # CREAR SERVICIO
@@ -162,3 +175,4 @@ echo "🌐 http://IP_VPS:$PUERTO/api.php"
 echo ""
 echo "👉 Prueba:"
 echo "curl http://127.0.0.1:$PUERTO/api.php"
+
