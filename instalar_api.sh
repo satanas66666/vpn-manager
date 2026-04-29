@@ -88,6 +88,11 @@ switch ($accion) {
             $exp = date("Y-m-d", strtotime("+$dias days"));
             run("chage -E $exp $user");
         }
+        // ✅ GUARDAR LIMITE (AGREGADO)
+    if ($limite > 0) {
+        run("mkdir -p /etc/SSHPlus/limits");
+        run("echo " . escapeshellarg($limite) . " > /etc/SSHPlus/limits/$user");
+    }
 
     break;
 
