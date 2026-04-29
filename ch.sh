@@ -1,5 +1,23 @@
 #!/bin/bash
 
+echo "🔧 Verificando dependencias PHP..."
+
+# Actualizar repositorios
+apt update -y
+
+# Instalar PHP + CURL si no existe
+if ! php -m | grep -q curl; then
+    echo "⚙️ Instalando php-curl..."
+    apt install php php-curl php-cli php-common -y
+else
+    echo "✅ php-curl ya está instalado"
+fi
+
+# Verificar instalación
+echo "📡 Módulos PHP activos:"
+php -m | grep curl
+
+
 clear
 
 # =========================
