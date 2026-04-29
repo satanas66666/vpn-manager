@@ -57,6 +57,7 @@ $pass  = $data['pass'] ?? '';
 $dias  = intval($data['dias'] ?? 0);
 $accion = $data['accion'] ?? '';
 $fecha = $data['fecha'] ?? '';
+$limite = intval($data['limite'] ?? 0);
 
 function run($cmd){
     return shell_exec("sudo $cmd 2>&1");
