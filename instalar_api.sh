@@ -67,15 +67,21 @@ switch ($accion) {
 
     case "crear":
         run("id $user || useradd -M -s /bin/false $user");
-        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
-
+        if (!empty($pass)) {
+    run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+}
         // 🔥 PRIORIDAD: usar fecha del panel
-        if (!empty($fecha)) {
-            run("chage -E $fecha $user");
-        } elseif ($dias > 0) {
-            // fallback (solo si no mandas fecha)
-            run("chage -E $(date -d '+$dias days' +%Y-%m-%d) $user");
-        }
+if (!empty($fecha)) {
+    run("chage -E $fecha $user");
+} elseif ($dias > 0) {
+
+    if ($dias <= 0) {
+        $dias = 1;
+    }
+
+    $exp = date("Y-m-d", strtotime("+$dias days"));
+    run("chage -E $exp $user");
+}
     break;
 
     case "eliminar":
@@ -144,7 +150,9 @@ switch ($accion) {
 break;
 
     case "reset":
-        run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+        if (!empty($pass)) {
+    run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+}
     break;
     
         // 🔥 👉 AQUI EXACTAMENTE 👇
@@ -263,5 +271,3 @@ echo "🌐 http://IP_VPS:$PUERTO/api.php"
 echo ""
 echo "👉 Prueba:"
 echo "curl http://127.0.0.1:$PUERTO/api.php"
-
-
