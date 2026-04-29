@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🔥 Instalando API VPS PRO..."
+echo "🔥 Instalando API VPS PRO (CORREGIDO)..."
 
 # =========================
 # CONFIG
@@ -25,63 +25,69 @@ mkdir -p /etc/SSHPlus/blocked
 mkdir -p /etc/SSHPlus/limits
 
 # =========================
-# CREAR API
+# CREAR API (SIN ERRORES)
 # =========================
-cat > $RUTA/api.php <<EOF
+cat > $RUTA/api.php <<'EOF'
 <?php
 
-if (\$_SERVER['REQUEST_METHOD'] !== 'POST') {
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo "API ONLINE ✅";
     exit;
 }
 
-\$TOKEN = "$TOKEN";
+$TOKEN = "ULTRA_SECRET_TOKEN";
 
-\$data = json_decode(file_get_contents("php://input"), true);
+$data = json_decode(file_get_contents("php://input"), true);
 
-if (!\$data) {
+if (!$data) {
     http_response_code(400);
     exit("JSON inválido");
 }
 
-if (!isset(\$data['token']) || \$data['token'] !== \$TOKEN) {
+if (!isset($data['token']) || $data['token'] !== $TOKEN) {
     http_response_code(403);
     exit("No autorizado");
 }
 
-\$user  = preg_replace('/[^a-zA-Z0-9]/', '', \$data['user'] ?? '');
-\$pass  = \$data['pass'] ?? '';
-\$dias  = intval(\$data['dias'] ?? 0);
-\$accion = \$data['accion'] ?? '';
-\$fecha = \$data['fecha'] ?? '';
+$user  = preg_replace('/[^a-zA-Z0-9]/', '', $data['user'] ?? '');
+$pass  = $data['pass'] ?? '';
+$dias  = intval($data['dias'] ?? 0);
+$accion = $data['accion'] ?? '';
+$fecha = $data['fecha'] ?? '';
 
-function run(\$cmd){
-    return shell_exec("sudo \$cmd 2>&1");
+function run($cmd){
+    return shell_exec("sudo $cmd 2>&1");
 }
 
-if (in_array(\$accion, ["crear","eliminar","bloquear","desbloquear","editar","reset"]) && empty(\$user)) {
+if (in_array($accion, ["crear","eliminar","bloquear","desbloquear","editar","reset"]) && empty($user)) {
     exit("Usuario inválido");
 }
 
 switch ($accion) {
 
     case "crear":
+
         run("id $user || useradd -M -s /bin/false $user");
+
         if (!empty($pass)) {
-    run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
-}
-        // 🔥 PRIORIDAD: usar fecha del panel
-if (!empty($fecha)) {
-    run("chage -E $fecha $user");
-} elseif ($dias > 0) {
+            run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+        }
 
-    if ($dias <= 0) {
-        $dias = 1;
-    }
+        if (!empty($fecha)) {
 
-    $exp = date("Y-m-d", strtotime("+$dias days"));
-    run("chage -E $exp $user");
-}
+            run("chage -E $fecha $user");
+
+        } elseif ($dias > 0) {
+
+            if ($dias <= 0) $dias = 1;
+
+            $exp = date("Y-m-d", strtotime("+$dias days"));
+            run("chage -E $exp $user");
+        }
+
     break;
 
     case "eliminar":
@@ -107,55 +113,44 @@ if (!empty($fecha)) {
 
     case "editar":
 
-    // =========================
-    // 🔥 SUMAR DÍAS (IGUAL QUE PANEL)
-    // =========================
-    if ($dias > 0) {
+        if ($dias > 0) {
 
-        $raw = run("chage -l $user | grep 'Account expires'");
-        $fecha_actual = "";
+            $raw = run("chage -l $user | grep 'Account expires'");
+            $fecha_actual = "";
 
-        if ($raw) {
-            $parts = explode(":", $raw);
-            $fecha_actual = trim($parts[1]);
+            if ($raw) {
+                $parts = explode(":", $raw);
+                $fecha_actual = trim($parts[1]);
+            }
+
+            if ($fecha_actual == "" || strtolower($fecha_actual) == "never") {
+                $base = time();
+            } else {
+                $base = strtotime($fecha_actual);
+            }
+
+            if ($base < time()) {
+                $base = time();
+            }
+
+            $nueva_fecha = strtotime("+$dias days", $base);
+            $formato = date("Y-m-d", $nueva_fecha);
+
+            run("chage -E $formato $user");
         }
 
-        // Si no tiene fecha o es never → usar hoy
-        if ($fecha_actual == "" || strtolower($fecha_actual) == "never") {
-            $base = time();
-        } else {
-            $base = strtotime($fecha_actual);
+        if (!empty($fecha)) {
+            run("chage -E $fecha $user");
         }
 
-        // Si ya expiró → empezar desde hoy
-        if ($base < time()) {
-            $base = time();
-        }
-
-        // Sumar días correctamente
-        $nueva_fecha = strtotime("+$dias days", $base);
-        $formato = date("Y-m-d", $nueva_fecha);
-
-        run("chage -E $formato $user");
-    }
-
-    // =========================
-    // 🔥 FECHA EXACTA (SOBRESCRIBE)
-    // =========================
-    if (!empty($fecha)) {
-
-        run("chage -E $fecha $user");
-    }
-
-break;
+    break;
 
     case "reset":
         if (!empty($pass)) {
-    run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
-}
+            run("echo " . escapeshellarg($user . ":" . $pass) . " | chpasswd");
+        }
     break;
-    
-        // 🔥 👉 AQUI EXACTAMENTE 👇
+
     case "limpiar_expirados":
 
         $users = explode("\n", trim(shell_exec("awk -F: '$3>=1000 {print $1}' /etc/passwd")));
@@ -164,7 +159,6 @@ break;
 
             if (empty($u)) continue;
 
-            // 🚫 NO ELIMINAR SI ESTA BLOQUEADO
             if (file_exists("/etc/SSHPlus/blocked/$u")) {
                 continue;
             }
@@ -199,7 +193,6 @@ break;
         echo "cleaned";
 
     break;
-    // 🔥 👉 FIN
 
     default:
         exit("Acción inválida");
@@ -229,14 +222,14 @@ EOF
 chmod -R 755 $RUTA
 
 # =========================
-# SUDO SIN PASSWORD
+# SUDO
 # =========================
 if ! grep -q "www-data ALL=(ALL) NOPASSWD: ALL" /etc/sudoers; then
     echo "www-data ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 fi
 
 # =========================
-# CREAR SERVICIO
+# SERVICIO
 # =========================
 cat > /etc/systemd/system/$SERVICIO.service <<EOF
 [Unit]
@@ -266,8 +259,9 @@ systemctl restart $SERVICIO
 ufw allow $PUERTO 2>/dev/null
 
 echo ""
-echo "✅ API VPS PRO INSTALADA"
+echo "✅ API VPS PRO INSTALADA CORRECTAMENTE"
 echo "🌐 http://IP_VPS:$PUERTO/api.php"
 echo ""
-echo "👉 Prueba:"
+echo "👉 PRUEBA:"
 echo "curl http://127.0.0.1:$PUERTO/api.php"
+
