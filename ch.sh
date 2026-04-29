@@ -2,6 +2,9 @@
 
 echo "🔧 Verificando dependencias PHP..."
 
+# Evitar interacción
+export DEBIAN_FRONTEND=noninteractive
+
 # Actualizar repositorios
 apt update -y
 
@@ -17,6 +20,9 @@ fi
 echo "📡 Módulos PHP activos:"
 php -m | grep curl
 
+echo "--------------------------------------"
+echo "🚀 Continuando instalación..."
+echo "--------------------------------------"
 
 clear
 
