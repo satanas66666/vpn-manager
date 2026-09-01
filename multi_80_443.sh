@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.7 AUTO-TUNE MAX PERF - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.8 PROXYGO GOLDEN EXACT - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -1096,7 +1096,7 @@ ssh_users_menu() {
 }
 
 # =====================================================================
-# PROXYGO NEW GOLDEN COMPAT - ROBUST PAYLOAD ENGINE
+# PROXYGO NEW GOLDEN - MOTOR GOLDEN MX EXACTO
 # Conserva la secuencia compatible de Golden MX:
 #   101 -> descarta payload/inyeccion inicial -> 200 <banner> -> SSH backend.
 # FIX V3.6: el Golden original hacia un solo Read(1024). Si el payload llegaba
@@ -1119,93 +1119,55 @@ import (
 	"time"
 )
 
-const (
-	firstPayloadWait = 3 * time.Second
-	payloadIdleWait  = 120 * time.Millisecond
-	maxInitialPayload = 64 * 1024
-	socketBuffer      = 1024 * 1024
-)
-
-func tuneTCP(c net.Conn) {
-	if tcp, ok := c.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcp.SetReadBuffer(socketBuffer)
-		_ = tcp.SetWriteBuffer(socketBuffer)
-	}
-}
-
-// drainInitialPayload descarta solamente la fase de inyeccion previa al SSH.
-// Espera hasta 3 s por el primer byte (compat Golden) y, una vez que empieza a
-// llegar, sigue drenando fragmentos mientras no haya una pausa de 120 ms.
-// No parsea HTTP ni WebSocket: por eso soporta payloads personalizados/raros.
-func drainInitialPayload(client net.Conn) {
-	buf := make([]byte, 8192)
-	total := 0
-	first := true
-
-	for total < maxInitialPayload {
-		if first {
-			_ = client.SetReadDeadline(time.Now().Add(firstPayloadWait))
-		} else {
-			_ = client.SetReadDeadline(time.Now().Add(payloadIdleWait))
-		}
-
-		n, err := client.Read(buf)
-		if n > 0 {
-			total += n
-			first = false
-		}
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				break
-			}
-			break
-		}
-	}
-	_ = client.SetReadDeadline(time.Time{})
-}
-
 func handle(client net.Conn, target string, banner string) {
 	defer client.Close()
-	tuneTCP(client)
+
+	if tcp, ok := client.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+	}
 
 	if banner == "" {
 		banner = "OK"
 	}
 
-	// Respuesta 101 compatible con ProxyGo NEW GOLDEN.
-	if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
-		return
-	}
+	// Primera respuesta fija
+	_, _ = client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n"))
 
-	// Drenar completamente la inyeccion aunque venga fragmentada o >1 KiB.
-	drainInitialPayload(client)
+	// Leer y tirar payload inicial para que NO llegue al SSH
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buffer := make([]byte, 1024)
+	_, _ = client.Read(buffer)
+	client.SetReadDeadline(time.Time{})
 
-	// Conectar primero el backend local. Asi no se entrega un 200 falso si SSH
-	// estuviera momentaneamente indisponible.
-	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	server, err := dialer.Dial("tcp", target)
+	// Aquí aparece el banner
+	_, _ = client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner)))
+
+	server, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		return
 	}
 	defer server.Close()
-	tuneTCP(server)
 
-	if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
-		return
+	if tcp, ok := server.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
 	}
 
 	done := make(chan struct{}, 2)
+
 	go func() {
-		_, _ = io.CopyBuffer(server, client, make([]byte, 64*1024))
+		_, _ = io.Copy(server, client)
 		done <- struct{}{}
 	}()
+
 	go func() {
-		_, _ = io.CopyBuffer(client, server, make([]byte, 64*1024))
+		_, _ = io.Copy(client, server)
 		done <- struct{}{}
 	}()
+
 	<-done
 }
 
@@ -1219,7 +1181,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("ProxyGo NEW GOLDEN ROBUST ONLINE", *listen, "->", *target, "BANNER:", *banner)
+
+	fmt.Println("ProxyGo ONLINE", *listen, "->", *target, "BANNER:", *banner)
 
 	for {
 		conn, err := ln.Accept()
@@ -1574,7 +1537,7 @@ optimize_auto_vps() {
   signature=$(auto_tune_signature)
 
   cat > "$AUTO_TUNE_SYSCTL" <<EOF
-# AUTO-TUNE V3.7 - generado segun recursos reales de la VPS.
+# AUTO-TUNE V3.8 - generado segun recursos reales de la VPS.
 # Perfil: ${AUTO_PROFILE} | CPU: ${AUTO_CPU} | RAM: ${AUTO_MEM_MB} MiB
 # Los buffers TCP son MAXIMOS dinamicos; no se reservan completos por conexion.
 fs.file-max = ${AUTO_FILEMAX}
