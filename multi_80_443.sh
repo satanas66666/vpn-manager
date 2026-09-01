@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER - INDEPENDIENTE
-# Target: Debian 11/12 (tambien suele funcionar en Debian 13)
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3 - INDEPENDIENTE
+# Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
 #   - V2Ray/Xray:   TLS -> HAProxy -> local Xray :10000
@@ -85,12 +85,31 @@ ensure_dirs() {
   fi
 }
 
+migrate_users_file() {
+  ensure_dirs
+  command -v jq >/dev/null 2>&1 || return 0
+  jq empty "$USERS_FILE" >/dev/null 2>&1 || { printf '[]\n' > "$USERS_FILE"; chmod 600 "$USERS_FILE"; return 0; }
+  local tmp
+  tmp=$(mktemp)
+  jq 'map(
+        . + {
+          port: ((.port // 443) | tonumber),
+          path: (.path // ""),
+          host: (.host // ""),
+          created: (.created // "")
+        }
+      )' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  install -m 600 "$tmp" "$USERS_FILE"
+  rm -f "$tmp"
+}
+
 load_state() {
   ensure_dirs
   if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
   fi
+  migrate_users_file >/dev/null 2>&1 || true
 }
 
 save_state() {
@@ -387,18 +406,18 @@ profile_name() {
 }
 
 xray_settings_for_protocol() {
-  local proto="$1" clients
+  local proto="$1" public_port="$2" clients
   case "$proto" in
     vmess)
-      clients=$(jq '[.[] | {id:.uuid, level:0, email:(.name + "@local")}]' "$USERS_FILE") || return 1
+      clients=$(jq --argjson port "$public_port" '[.[] | select(((.port // 443)|tonumber)==$port) | {id:.uuid, level:0, email:(.name + "-" + ($port|tostring) + "@local")}]' "$USERS_FILE") || return 1
       jq -nc --argjson c "$clients" '{clients:$c}'
       ;;
     vless)
-      clients=$(jq '[.[] | {id:.uuid, level:0, email:(.name + "@local")}]' "$USERS_FILE") || return 1
+      clients=$(jq --argjson port "$public_port" '[.[] | select(((.port // 443)|tonumber)==$port) | {id:.uuid, level:0, email:(.name + "-" + ($port|tostring) + "@local")}]' "$USERS_FILE") || return 1
       jq -nc --argjson c "$clients" '{clients:$c,decryption:"none"}'
       ;;
     trojan)
-      clients=$(jq '[.[] | {password:.password, level:0, email:(.name + "@local")}]' "$USERS_FILE") || return 1
+      clients=$(jq --argjson port "$public_port" '[.[] | select(((.port // 443)|tonumber)==$port) | {password:.password, level:0, email:(.name + "-" + ($port|tostring) + "@local")}]' "$USERS_FILE") || return 1
       jq -nc --argjson c "$clients" '{clients:$c}'
       ;;
     *) return 1 ;;
@@ -424,7 +443,7 @@ build_xray_config() {
 ' > "$USERS_FILE"
 
   local set443 stream443 inbound443 inbounds tmp
-  set443=$(xray_settings_for_protocol "$XRAY_PROTOCOL") || return 1
+  set443=$(xray_settings_for_protocol "$XRAY_PROTOCOL" 443) || return 1
   stream443=$(xray_stream_for "$XRAY_TRANSPORT" "$XRAY_PATH" "$XRAY_GRPC_SERVICE" "$XRAY_XHTTP_MODE") || return 1
   inbound443=$(jq -nc --arg proto "$XRAY_PROTOCOL" --argjson settings "$set443" --argjson stream "$stream443" --argjson port "$XRAY_PORT" '{tag:"shared443-in",listen:"127.0.0.1",port:$port,protocol:$proto,settings:$settings,streamSettings:$stream}')
   inbounds=$(jq -nc --argjson a "$inbound443" '[$a]')
@@ -435,7 +454,7 @@ build_xray_config() {
       *) echo 'Puerto 80 compartido solo admite WS/XHTTP/gRPC/HTTPUpgrade.'; return 1 ;;
     esac
     local set80 stream80 inbound80
-    set80=$(xray_settings_for_protocol "$XRAY80_PROTOCOL") || return 1
+    set80=$(xray_settings_for_protocol "$XRAY80_PROTOCOL" 80) || return 1
     stream80=$(xray_stream_for "$XRAY80_TRANSPORT" "$XRAY80_PATH" "$XRAY80_GRPC_SERVICE" "$XRAY80_XHTTP_MODE") || return 1
     inbound80=$(jq -nc --arg proto "$XRAY80_PROTOCOL" --argjson settings "$set80" --argjson stream "$stream80" --argjson port "$XRAY80_PORT" '{tag:"shared80-in",listen:"127.0.0.1",port:$port,protocol:$proto,settings:$settings,streamSettings:$stream}')
     inbounds=$(jq -nc --argjson a "$inbounds" --argjson b "$inbound80" '$a + [$b]')
@@ -587,52 +606,258 @@ valid_username() {
   [[ "$1" =~ ^[A-Za-z0-9._-]{1,32}$ ]]
 }
 
+valid_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+normalize_path_value() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  [[ "$p" == /* ]] || p="/$p"
+  # Evitar romper la configuracion HAProxy cuando el path pertenece al puerto 80.
+  [[ "$p" != *$'\n'* && "$p" != *$'\r'* && "$p" != *'"'* ]] || return 1
+  printf '%s' "$p"
+}
+
+generate_default_path() {
+  local port="$1" user="$2" rnd
+  rnd=$(openssl rand -hex 4 2>/dev/null || printf '%08x' "$RANDOM")
+  printf '/xray-%s-%s-%s' "$port" "$user" "$rnd"
+}
+
+generate_uuid_value() {
+  local u=''
+  if [[ -x "$XRAY_BIN" ]]; then
+    u=$($XRAY_BIN uuid 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -z "$u" ]] && command -v uuidgen >/dev/null 2>&1; then
+    u=$(uuidgen 2>/dev/null || true)
+  fi
+  if [[ -z "$u" && -r /proc/sys/kernel/random/uuid ]]; then
+    u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+  fi
+  if [[ -z "$u" ]]; then
+    local h
+    h=$(openssl rand -hex 16)
+    u="${h:0:8}-${h:8:4}-${h:12:4}-${h:16:4}-${h:20:12}"
+  fi
+  printf '%s' "${u,,}"
+}
+
+users_on_port() {
+  local port="$1"
+  jq --argjson port "$port" '[.[] | select(((.port // 443)|tonumber)==$port)] | length' "$USERS_FILE" 2>/dev/null || echo 0
+}
+
 create_xray_user() {
   load_state
   ensure_dirs
+  migrate_users_file || { echo 'No se pudo preparar la base de usuarios.'; pause; return 0; }
+
+  safe_clear
+  bar
+  echo -e "${C_GOLD}           CREAR USUARIO V2RAY/XRAY - PUERTO 80/443${C_RESET}"
+  bar
+  echo "[1] PUERTO 443  -> $(profile_name)"
+  if [[ "$XRAY80_ENABLED" == '1' ]]; then
+    echo "[2] PUERTO 80   -> $(xray80_profile_name)"
+  else
+    echo -e "[2] PUERTO 80   -> ${C_RED}DESACTIVADO${C_RESET} (configuralo primero en opcion 7)"
+  fi
+  echo '[0] VOLVER'
+  bar
+
+  local sel public_port proto transport current_path current_grpc current_mode security
+  read -r -p 'Selecciona el puerto para este usuario: ' sel
+  case "$sel" in
+    1|443)
+      public_port=443
+      proto="$XRAY_PROTOCOL"
+      transport="$XRAY_TRANSPORT"
+      current_path="$XRAY_PATH"
+      current_grpc="$XRAY_GRPC_SERVICE"
+      current_mode="$XRAY_XHTTP_MODE"
+      security='tls'
+      ;;
+    2|80)
+      if [[ "$XRAY80_ENABLED" != '1' ]]; then
+        echo 'Xray en puerto 80 esta desactivado. Activalo/configuralo en la opcion 7.'
+        pause; return 0
+      fi
+      public_port=80
+      proto="$XRAY80_PROTOCOL"
+      transport="$XRAY80_TRANSPORT"
+      current_path="$XRAY80_PATH"
+      current_grpc="$XRAY80_GRPC_SERVICE"
+      current_mode="$XRAY80_XHTTP_MODE"
+      security='none'
+      ;;
+    0) return 0 ;;
+    *) echo 'Puerto/opcion invalida.'; pause; return 0 ;;
+  esac
+
+  echo
+  echo "Puerto seleccionado : $public_port"
+  echo "Protocolo           : ${proto^^}"
+  echo "Transporte          : $transport"
+  echo "Seguridad           : $security"
+  [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]] && echo "Path actual          : $current_path"
+  [[ "$transport" == 'grpc' ]] && echo "ServiceName actual   : $current_grpc"
+  bar
+
+  local name existing_count path_input selected_path service_input selected_service host_input host uuid password cred_input tmp created
   read -r -p 'Nombre del usuario V2RAY: ' name
   if ! valid_username "$name"; then
     echo 'Nombre invalido. Usa letras, numeros, punto, guion o guion bajo.'
-    pause
-    return 0
+    pause; return 0
   fi
-  if jq -e --arg n "$name" '.[] | select(.name==$n)' "$USERS_FILE" >/dev/null; then
-    echo 'Ese usuario ya existe.'
-    pause
-    return 0
+  if jq -e --arg n "$name" --argjson port "$public_port" '.[] | select(.name==$n and (((.port // 443)|tonumber)==$port))' "$USERS_FILE" >/dev/null; then
+    echo "Ese usuario ya existe en el puerto $public_port."
+    pause; return 0
   fi
-  local uuid password tmp
-  if [[ -x "$XRAY_BIN" ]]; then
-    uuid=$($XRAY_BIN uuid 2>/dev/null | head -n1)
+
+  existing_count=$(users_on_port "$public_port")
+  selected_path="$current_path"
+  selected_service="$current_grpc"
+
+  if [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]]; then
+    if [[ "$existing_count" -gt 0 ]]; then
+      echo -e "${C_GOLD}Ya existen $existing_count usuario(s) en :$public_port.${C_RESET}"
+      echo 'ENTER conserva el Path actual para no romper los usuarios existentes.'
+      echo 'Escribe AUTO para generar uno nuevo, o escribe tu Path manual.'
+      read -r -p "Path [$current_path]: " path_input
+      if [[ -z "$path_input" ]]; then
+        selected_path="$current_path"
+      elif [[ "${path_input^^}" == 'AUTO' ]]; then
+        selected_path=$(generate_default_path "$public_port" "$name")
+      else
+        selected_path=$(normalize_path_value "$path_input") || { echo 'Path invalido.'; pause; return 0; }
+      fi
+      if [[ "$selected_path" != "$current_path" ]]; then
+        echo -e "${C_GOLD}Cambiar el Path de :$public_port cambia el Path para TODOS los usuarios de ese puerto.${C_RESET}"
+        read -r -p 'Escribe SI para aplicar el nuevo Path: ' confirm_path
+        if [[ "$confirm_path" != 'SI' ]]; then
+          selected_path="$current_path"
+          echo 'Se conserva el Path actual.'
+        fi
+      fi
+    else
+      echo 'Puedes escribir tu Path exacto. Si dejas ENTER se genera automaticamente.'
+      read -r -p 'Path (ENTER = automatico): ' path_input
+      if [[ -z "$path_input" || "${path_input^^}" == 'AUTO' ]]; then
+        selected_path=$(generate_default_path "$public_port" "$name")
+      else
+        selected_path=$(normalize_path_value "$path_input") || { echo 'Path invalido.'; pause; return 0; }
+      fi
+    fi
+  elif [[ "$transport" == 'grpc' ]]; then
+    if [[ "$existing_count" -gt 0 ]]; then
+      read -r -p "ServiceName gRPC [$current_grpc] (ENTER conserva): " service_input
+      selected_service="${service_input:-$current_grpc}"
+    else
+      read -r -p 'ServiceName gRPC (ENTER = automatico): ' service_input
+      selected_service="${service_input:-grpc-${public_port}-${name}-$(openssl rand -hex 3)}"
+    fi
+  fi
+
+  host=$(host_for_clients)
+  read -r -p "Host/SNI para link [$host] (ENTER = automatico): " host_input
+  [[ -n "$host_input" ]] && host="$host_input"
+
+  if [[ "$proto" == 'trojan' ]]; then
+    read -r -p 'Password personalizado (ENTER = automatico): ' cred_input
+    password="${cred_input:-$(openssl rand -hex 16)}"
+    uuid=$(generate_uuid_value)
   else
-    uuid=$(uuidgen | tr 'A-F' 'a-f')
+    read -r -p 'UUID personalizado (ENTER = automatico): ' cred_input
+    if [[ -z "$cred_input" ]]; then
+      uuid=$(generate_uuid_value)
+    else
+      uuid="$cred_input"
+    fi
+    if ! valid_uuid "$uuid"; then
+      echo 'UUID INVALIDO. Usa formato UUID correcto o deja ENTER para automatico.'
+      pause; return 0
+    fi
+    uuid="${uuid,,}"
+    if jq -e --arg u "$uuid" '.[] | select(.uuid==$u)' "$USERS_FILE" >/dev/null; then
+      echo 'Ese UUID ya existe. Usa otro o deja ENTER para generar uno.'
+      pause; return 0
+    fi
+    password=$(openssl rand -hex 16)
   fi
-  password=$(openssl rand -hex 16)
+
+  # El Path/ServiceName pertenece al inbound del puerto, igual que en GOLDEN MX.
+  if [[ "$public_port" -eq 443 ]]; then
+    [[ -n "$selected_path" ]] && XRAY_PATH="$selected_path"
+    [[ -n "$selected_service" ]] && XRAY_GRPC_SERVICE="$selected_service"
+  else
+    [[ -n "$selected_path" ]] && XRAY80_PATH="$selected_path"
+    [[ -n "$selected_service" ]] && XRAY80_GRPC_SERVICE="$selected_service"
+  fi
+  save_state
+
+  # Si se cambio el Path, sincronizarlo en los registros del mismo puerto.
+  if [[ -n "$selected_path" ]]; then
+    tmp=$(mktemp)
+    jq --argjson port "$public_port" --arg path "$selected_path" \
+      'map(if (((.port // 443)|tonumber)==$port) then .path=$path else . end)' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 600 "$tmp" "$USERS_FILE"
+    rm -f "$tmp"
+  fi
+
+  created=$(date '+%F %T')
   tmp=$(mktemp)
-  jq --arg n "$name" --arg u "$uuid" --arg p "$password" '. + [{name:$n,uuid:$u,password:$p}]' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  jq --arg n "$name" --arg u "$uuid" --arg p "$password" --argjson port "$public_port" --arg host "$host" --arg path "$selected_path" --arg created "$created" \
+    '. + [{name:$n,uuid:$u,password:$p,port:$port,host:$host,path:$path,created:$created}]' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
   install -m 600 "$tmp" "$USERS_FILE"
   rm -f "$tmp"
-  echo -e "${C_GREEN}Usuario creado: $name${C_RESET}"
-  [[ -x "$XRAY_BIN" ]] && build_xray_config || true
-  show_one_xray_user "$name"
+
+  if [[ -x "$XRAY_BIN" ]]; then
+    if ! build_xray_config; then
+      echo 'ERROR: no se pudo aplicar el usuario a Xray.'
+      pause; return 0
+    fi
+  fi
+  write_haproxy_config >/dev/null 2>&1 || true
+
+  bar
+  echo -e "${C_GREEN}USUARIO CREADO CORRECTAMENTE${C_RESET}"
+  echo "Usuario : $name"
+  echo "Puerto  : $public_port"
+  if [[ "$proto" == 'trojan' ]]; then echo "Password: $password"; else echo "UUID    : $uuid"; fi
+  [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]] && echo "Path    : $selected_path"
+  [[ "$transport" == 'grpc' ]] && echo "gRPC    : $selected_service"
+  bar
+  if [[ "$public_port" -eq 443 ]]; then show_one_xray_user "$name"; else show_one_xray_user80 "$name"; fi
   pause
 }
 
 delete_xray_user() {
+  load_state
   ensure_dirs
-  local name tmp
+  migrate_users_file || true
+  local port name tmp count
+  safe_clear
+  bar
+  echo -e "${C_GOLD}              ELIMINAR USUARIO V2RAY/XRAY${C_RESET}"
+  bar
+  jq -r '.[] | "- " + .name + "  Puerto:" + (((.port // 443)|tonumber)|tostring)' "$USERS_FILE" 2>/dev/null || true
+  bar
+  read -r -p 'Puerto del usuario [443/80]: ' port
+  [[ "$port" == '443' || "$port" == '80' ]] || { echo 'Puerto invalido.'; pause; return 0; }
   read -r -p 'Usuario V2RAY a eliminar: ' name
-  if ! jq -e --arg n "$name" '.[] | select(.name==$n)' "$USERS_FILE" >/dev/null; then
-    echo 'No existe.'
-    pause
-    return 0
+  if ! jq -e --arg n "$name" --argjson port "$port" '.[] | select(.name==$n and (((.port // 443)|tonumber)==$port))' "$USERS_FILE" >/dev/null; then
+    echo "No existe ese usuario en el puerto $port."
+    pause; return 0
   fi
   tmp=$(mktemp)
-  jq --arg n "$name" '[.[] | select(.name!=$n)]' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  jq --arg n "$name" --argjson port "$port" '[.[] | select(.name!=$n or (((.port // 443)|tonumber)!=$port))]' "$USERS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
   install -m 600 "$tmp" "$USERS_FILE"
   rm -f "$tmp"
   [[ -x "$XRAY_BIN" ]] && build_xray_config || true
-  echo -e "${C_GREEN}Usuario eliminado.${C_RESET}"
+  write_haproxy_config >/dev/null 2>&1 || true
+  echo -e "${C_GREEN}Usuario eliminado del puerto $port.${C_RESET}"
   pause
 }
 
@@ -642,15 +867,16 @@ uri_encode() {
 
 show_one_xray_user() {
   load_state
-  local name="$1" row uuid pass host label p_enc s_enc name_enc net vmjson link
-  row=$(jq -c --arg n "$name" '.[] | select(.name==$n)' "$USERS_FILE" | head -n1)
+  local name="$1" row uuid pass host label p_enc s_enc name_enc net vmjson link row_path
+  row=$(jq -c --arg n "$name" '.[] | select(.name==$n and (((.port // 443)|tonumber)==443))' "$USERS_FILE" | head -n1)
   [[ -n "$row" ]] || return 1
   uuid=$(jq -r '.uuid' <<<"$row")
   pass=$(jq -r '.password' <<<"$row")
-  host=$(host_for_clients)
+  host=$(jq -r '.host // empty' <<<"$row"); [[ -n "$host" ]] || host=$(host_for_clients)
+  row_path=$(jq -r '.path // empty' <<<"$row"); [[ -n "$row_path" ]] || row_path="$XRAY_PATH"
   label="${name}-443"
   name_enc=$(uri_encode "$label")
-  p_enc=$(uri_encode "$XRAY_PATH")
+  p_enc=$(uri_encode "$row_path")
   s_enc=$(uri_encode "$XRAY_GRPC_SERVICE")
 
   bar
@@ -664,39 +890,17 @@ show_one_xray_user() {
   case "$XRAY_PROTOCOL" in
     vless)
       case "$XRAY_TRANSPORT" in
-        websocket)
-          link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=ws&host=$(uri_encode "$DOMAIN")&path=${p_enc}#${name_enc}"
-          ;;
-        xhttp)
-          link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=xhttp&path=${p_enc}&mode=$(uri_encode "$XRAY_XHTTP_MODE")#${name_enc}"
-          ;;
-        grpc)
-          link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=grpc&serviceName=${s_enc}#${name_enc}"
-          ;;
-        raw)
-          link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=tcp#${name_enc}"
-          ;;
-        httpupgrade)
-          link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=httpupgrade&host=$(uri_encode "$DOMAIN")&path=${p_enc}#${name_enc}"
-          ;;
+        websocket) link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=ws&host=$(uri_encode "$DOMAIN")&path=${p_enc}#${name_enc}" ;;
+        xhttp) link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=xhttp&path=${p_enc}&mode=$(uri_encode "$XRAY_XHTTP_MODE")#${name_enc}" ;;
+        grpc) link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=grpc&serviceName=${s_enc}#${name_enc}" ;;
+        raw) link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=tcp#${name_enc}" ;;
+        httpupgrade) link="vless://${uuid}@${host}:443?encryption=none&security=tls&sni=$(uri_encode "$DOMAIN")&type=httpupgrade&host=$(uri_encode "$DOMAIN")&path=${p_enc}#${name_enc}" ;;
       esac
       echo "UUID   : $uuid"
       ;;
     vmess)
-      case "$XRAY_TRANSPORT" in
-        websocket) net='ws' ;;
-        grpc) net='grpc' ;;
-        raw) net='tcp' ;;
-        xhttp) net='xhttp' ;;
-        httpupgrade) net='httpupgrade' ;;
-        *) net='tcp' ;;
-      esac
-      vmjson=$(jq -nc \
-        --arg v '2' --arg ps "$label" --arg add "$host" --arg port '443' --arg id "$uuid" \
-        --arg aid '0' --arg scy 'auto' --arg net "$net" --arg type 'none' \
-        --arg host "$DOMAIN" --arg path "$XRAY_PATH" --arg tls 'tls' --arg sni "$DOMAIN" \
-        --arg serviceName "$XRAY_GRPC_SERVICE" \
-        '{v:$v,ps:$ps,add:$add,port:$port,id:$id,aid:$aid,scy:$scy,net:$net,type:$type,host:$host,path:(if $net=="grpc" then $serviceName else $path end),tls:$tls,sni:$sni}')
+      case "$XRAY_TRANSPORT" in websocket) net='ws' ;; grpc) net='grpc' ;; raw) net='tcp' ;; xhttp) net='xhttp' ;; httpupgrade) net='httpupgrade' ;; *) net='tcp' ;; esac
+      vmjson=$(jq -nc --arg v '2' --arg ps "$label" --arg add "$host" --arg port '443' --arg id "$uuid" --arg aid '0' --arg scy 'auto' --arg net "$net" --arg type 'none' --arg host "$DOMAIN" --arg path "$row_path" --arg tls 'tls' --arg sni "$DOMAIN" --arg serviceName "$XRAY_GRPC_SERVICE" '{v:$v,ps:$ps,add:$add,port:$port,id:$id,aid:$aid,scy:$scy,net:$net,type:$type,host:$host,path:(if $net=="grpc" then $serviceName else $path end),tls:$tls,sni:$sni}')
       link="vmess://$(printf '%s' "$vmjson" | base64 -w0)"
       echo "UUID   : $uuid"
       ;;
@@ -705,29 +909,22 @@ show_one_xray_user() {
       echo "Password: $pass"
       ;;
   esac
-
-  case "$XRAY_TRANSPORT" in
-    websocket|httpupgrade) echo "Path   : $XRAY_PATH" ;;
-    xhttp) echo "Path   : $XRAY_PATH"; echo "XHTTP  : $XRAY_XHTTP_MODE" ;;
-    grpc) echo "gRPC   : $XRAY_GRPC_SERVICE" ;;
-  esac
-  echo
-  echo 'LINK:'
-  echo "$link"
-  bar
+  case "$XRAY_TRANSPORT" in websocket|httpupgrade) echo "Path   : $row_path" ;; xhttp) echo "Path   : $row_path"; echo "XHTTP  : $XRAY_XHTTP_MODE" ;; grpc) echo "gRPC   : $XRAY_GRPC_SERVICE" ;; esac
+  echo; echo 'LINK:'; echo "$link"; bar
 }
 
 show_one_xray_user80() {
   load_state
   [[ "$XRAY80_ENABLED" == '1' ]] || return 0
-  local name="$1" row uuid host label name_enc p_enc s_enc link vmjson net
-  row=$(jq -c --arg n "$name" '.[] | select(.name==$n)' "$USERS_FILE" | head -n1)
+  local name="$1" row uuid host label name_enc p_enc s_enc link vmjson net row_path
+  row=$(jq -c --arg n "$name" '.[] | select(.name==$n and (((.port // 443)|tonumber)==80))' "$USERS_FILE" | head -n1)
   [[ -n "$row" ]] || return 1
   uuid=$(jq -r '.uuid' <<<"$row")
-  host=$(host_for_clients)
+  host=$(jq -r '.host // empty' <<<"$row"); [[ -n "$host" ]] || host=$(host_for_clients)
+  row_path=$(jq -r '.path // empty' <<<"$row"); [[ -n "$row_path" ]] || row_path="$XRAY80_PATH"
   label="${name}-80"
   name_enc=$(uri_encode "$label")
-  p_enc=$(uri_encode "$XRAY80_PATH")
+  p_enc=$(uri_encode "$row_path")
   s_enc=$(uri_encode "$XRAY80_GRPC_SERVICE")
   echo
   echo -e "${C_GOLD}PUERTO 80 COMPARTIDO CON PROXYGO:${C_RESET}"
@@ -746,45 +943,39 @@ show_one_xray_user80() {
       echo "UUID   : $uuid"
       ;;
     vmess)
-      case "$XRAY80_TRANSPORT" in
-        websocket) net='ws' ;;
-        *) net="$XRAY80_TRANSPORT" ;;
-      esac
-      vmjson=$(jq -nc --arg v '2' --arg ps "$label" --arg add "$host" --arg port '80' --arg id "$uuid" --arg aid '0' --arg scy 'auto' --arg net "$net" --arg type 'none' --arg host "$DOMAIN" --arg path "$XRAY80_PATH" --arg tls '' '{v:$v,ps:$ps,add:$add,port:$port,id:$id,aid:$aid,scy:$scy,net:$net,type:$type,host:$host,path:$path,tls:$tls}')
+      case "$XRAY80_TRANSPORT" in websocket) net='ws' ;; *) net="$XRAY80_TRANSPORT" ;; esac
+      vmjson=$(jq -nc --arg v '2' --arg ps "$label" --arg add "$host" --arg port '80' --arg id "$uuid" --arg aid '0' --arg scy 'auto' --arg net "$net" --arg type 'none' --arg host "$DOMAIN" --arg path "$row_path" --arg tls '' '{v:$v,ps:$ps,add:$add,port:$port,id:$id,aid:$aid,scy:$scy,net:$net,type:$type,host:$host,path:$path,tls:$tls}')
       link="vmess://$(printf '%s' "$vmjson" | base64 -w0)"
       echo "UUID   : $uuid"
       ;;
   esac
-  case "$XRAY80_TRANSPORT" in
-    websocket|httpupgrade) echo "Path   : $XRAY80_PATH" ;;
-    xhttp) echo "Path   : $XRAY80_PATH"; echo "XHTTP  : $XRAY80_XHTTP_MODE" ;;
-    grpc) echo "gRPC   : $XRAY80_GRPC_SERVICE" ;;
-  esac
-  echo 'LINK 80:'
-  echo "$link"
-  bar
+  case "$XRAY80_TRANSPORT" in websocket|httpupgrade) echo "Path   : $row_path" ;; xhttp) echo "Path   : $row_path"; echo "XHTTP  : $XRAY80_XHTTP_MODE" ;; grpc) echo "gRPC   : $XRAY80_GRPC_SERVICE" ;; esac
+  echo 'LINK 80:'; echo "$link"; bar
 }
 
 show_xray_users() {
   load_state
   ensure_dirs
+  migrate_users_file || true
   safe_clear
   bar
-  echo -e "${C_GOLD}             USUARIOS + LINKS V2RAY/XRAY${C_RESET}"
+  echo -e "${C_GOLD}          USUARIOS + LINKS V2RAY/XRAY 80 / 443${C_RESET}"
   bar
-  local count
+  local count c443 c80
   count=$(jq 'length' "$USERS_FILE")
-  echo "Perfil actual: $(profile_name)"
-  echo "Usuarios: $count"
+  c443=$(users_on_port 443)
+  c80=$(users_on_port 80)
+  echo "Perfil 443 : $(profile_name)"
+  echo "Perfil 80  : $(xray80_profile_name)"
+  echo "Usuarios   : $count total | 443=$c443 | 80=$c80"
   echo
   if [[ "$count" -eq 0 ]]; then
     echo 'No hay usuarios V2RAY creados.'
   else
-    while IFS= read -r name; do
-      show_one_xray_user "$name"
-      show_one_xray_user80 "$name"
+    while IFS=$'\t' read -r name port; do
+      if [[ "$port" == '80' ]]; then show_one_xray_user80 "$name"; else show_one_xray_user "$name"; fi
       echo
-    done < <(jq -r '.[].name' "$USERS_FILE")
+    done < <(jq -r '.[] | [.name, (((.port // 443)|tonumber)|tostring)] | @tsv' "$USERS_FILE")
   fi
   write_info_file >/dev/null 2>&1 || true
   pause
@@ -1251,8 +1442,8 @@ write_info_file() {
   local host
   host=$(host_for_clients)
   {
-    echo 'SSL + V2RAY/XRAY 443 MANAGER'
-    echo '================================'
+    echo 'SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER'
+    echo '==========================================='
     echo "Host/IP      : $host"
     echo 'Puertos publicos: 443 TCP (SSL+Xray) / 80 TCP (ProxyGo+Xray HTTP-like)'
     echo "Certificado  : $CERT_MODE"
@@ -1273,16 +1464,13 @@ write_info_file() {
     echo
     echo 'V2RAY/XRAY'
     echo '-----------'
-    echo "Perfil   : $(profile_name)"
-    echo "Local    : 127.0.0.1:${XRAY_PORT}"
-    case "$XRAY_TRANSPORT" in
-      websocket|httpupgrade) echo "Path     : $XRAY_PATH" ;;
-      xhttp) echo "Path     : $XRAY_PATH"; echo "Mode     : $XRAY_XHTTP_MODE" ;;
-      grpc) echo "Service  : $XRAY_GRPC_SERVICE" ;;
-    esac
+    echo "Perfil 443: $(profile_name)"
+    echo "Path 443  : $XRAY_PATH"
+    echo "Perfil 80 : $(xray80_profile_name)"
+    echo "Path 80   : $XRAY80_PATH"
     echo
     echo 'Usuarios V2Ray:'
-    jq -r '.[] | "- " + .name + " UUID=" + .uuid + " PASS=" + .password' "$USERS_FILE" 2>/dev/null || true
+    jq -r '.[] | "- " + .name + " PORT=" + (((.port // 443)|tonumber)|tostring) + " UUID=" + .uuid + " PASS=" + .password + " PATH=" + (.path // "")' "$USERS_FILE" 2>/dev/null || true
   } > "$INFO_FILE"
   chmod 600 "$INFO_FILE"
 }
@@ -1294,9 +1482,9 @@ install_everything() {
   install_xray_core || { pause; return 0; }
   if [[ $(jq 'length' "$USERS_FILE" 2>/dev/null || echo 0) -eq 0 ]]; then
     local uuid pass
-    uuid=$($XRAY_BIN uuid 2>/dev/null | head -n1); [[ -n "$uuid" ]] || uuid=$(uuidgen | tr 'A-F' 'a-f')
+    uuid=$(generate_uuid_value)
     pass=$(openssl rand -hex 16)
-    jq -n --arg u "$uuid" --arg p "$pass" '[{name:"cliente1",uuid:$u,password:$p}]' > "$USERS_FILE"
+    jq -n --arg u "$uuid" --arg p "$pass" '[{name:"cliente1",uuid:$u,password:$p,port:443,host:"",path:"",created:""}]' > "$USERS_FILE"
     chmod 600 "$USERS_FILE"
   fi
   proxygo_compile_golden || { pause; return 0; }
@@ -1369,7 +1557,7 @@ main_menu() {
     echo '[7]  ELEGIR V2RAY/XRAY PARA PUERTO 80 COMPARTIDO'
     echo '[8]  CREAR USUARIO V2RAY'
     echo '[9]  ELIMINAR USUARIO V2RAY'
-    echo '[10] MOSTRAR USUARIOS + LINKS V2RAY 443'
+    echo '[10] MOSTRAR USUARIOS + LINKS V2RAY 80/443'
     echo '[11] USUARIOS SSH PARA SSL DIRECTO'
     echo '[12] ESTADO GENERAL / PUERTOS'
     echo '[13] DIAGNOSTICO'
