@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.5 PORT80 DUAL ROUTER FIX - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.6 PROXYGO ROBUST + OPT - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -1082,10 +1082,14 @@ ssh_users_menu() {
 }
 
 # =====================================================================
-# PROXYGO NEW GOLDEN - MOTOR EXACTO DEL GOLDEN MX
-# La logica del motor se conserva: 101 -> descarta payload inicial ->
-# 200 <banner> -> tunel TCP al backend. Solo cambia el LISTEN del puerto 80:
-# queda local 127.0.0.1:18080 para que HAProxy pueda compartir publicamente :80.
+# PROXYGO NEW GOLDEN COMPAT - ROBUST PAYLOAD ENGINE
+# Conserva la secuencia compatible de Golden MX:
+#   101 -> descarta payload/inyeccion inicial -> 200 <banner> -> SSH backend.
+# FIX V3.6: el Golden original hacia un solo Read(1024). Si el payload llegaba
+# fragmentado o superaba 1024 bytes, podian quedar bytes de inyeccion pendientes
+# y contaminar el handshake SSH. Aqui se drena la inyeccion completa por rafagas,
+# sin interpretar su contenido: acepta payloads HTTP/WS raros, UTF-8 y fragmentados.
+# El LISTEN sigue local 127.0.0.1:18080 para compartir :80 con Xray via HAProxy.
 # =====================================================================
 proxygo_compile_golden() {
   install_base || return 1
@@ -1101,55 +1105,93 @@ import (
 	"time"
 )
 
-func handle(client net.Conn, target string, banner string) {
-	defer client.Close()
+const (
+	firstPayloadWait = 3 * time.Second
+	payloadIdleWait  = 120 * time.Millisecond
+	maxInitialPayload = 64 * 1024
+	socketBuffer      = 1024 * 1024
+)
 
-	if tcp, ok := client.(*net.TCPConn); ok {
+func tuneTCP(c net.Conn) {
+	if tcp, ok := c.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetReadBuffer(socketBuffer)
+		_ = tcp.SetWriteBuffer(socketBuffer)
 	}
+}
+
+// drainInitialPayload descarta solamente la fase de inyeccion previa al SSH.
+// Espera hasta 3 s por el primer byte (compat Golden) y, una vez que empieza a
+// llegar, sigue drenando fragmentos mientras no haya una pausa de 120 ms.
+// No parsea HTTP ni WebSocket: por eso soporta payloads personalizados/raros.
+func drainInitialPayload(client net.Conn) {
+	buf := make([]byte, 8192)
+	total := 0
+	first := true
+
+	for total < maxInitialPayload {
+		if first {
+			_ = client.SetReadDeadline(time.Now().Add(firstPayloadWait))
+		} else {
+			_ = client.SetReadDeadline(time.Now().Add(payloadIdleWait))
+		}
+
+		n, err := client.Read(buf)
+		if n > 0 {
+			total += n
+			first = false
+		}
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			break
+		}
+	}
+	_ = client.SetReadDeadline(time.Time{})
+}
+
+func handle(client net.Conn, target string, banner string) {
+	defer client.Close()
+	tuneTCP(client)
 
 	if banner == "" {
 		banner = "OK"
 	}
 
-	// Primera respuesta fija
-	_, _ = client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n"))
+	// Respuesta 101 compatible con ProxyGo NEW GOLDEN.
+	if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
 
-	// Leer y tirar payload inicial para que NO llegue al SSH
-	client.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buffer := make([]byte, 1024)
-	_, _ = client.Read(buffer)
-	client.SetReadDeadline(time.Time{})
+	// Drenar completamente la inyeccion aunque venga fragmentada o >1 KiB.
+	drainInitialPayload(client)
 
-	// Aquí aparece el banner
-	_, _ = client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner)))
-
-	server, err := net.DialTimeout("tcp", target, 10*time.Second)
+	// Conectar primero el backend local. Asi no se entrega un 200 falso si SSH
+	// estuviera momentaneamente indisponible.
+	dialer := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	server, err := dialer.Dial("tcp", target)
 	if err != nil {
 		return
 	}
 	defer server.Close()
+	tuneTCP(server)
 
-	if tcp, ok := server.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+	if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
+		return
 	}
 
 	done := make(chan struct{}, 2)
-
 	go func() {
-		_, _ = io.Copy(server, client)
+		_, _ = io.CopyBuffer(server, client, make([]byte, 64*1024))
 		done <- struct{}{}
 	}()
-
 	go func() {
-		_, _ = io.Copy(client, server)
+		_, _ = io.CopyBuffer(client, server, make([]byte, 64*1024))
 		done <- struct{}{}
 	}()
-
 	<-done
 }
 
@@ -1163,8 +1205,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-
-	fmt.Println("ProxyGo ONLINE", *listen, "->", *target, "BANNER:", *banner)
+	fmt.Println("ProxyGo NEW GOLDEN ROBUST ONLINE", *listen, "->", *target, "BANNER:", *banner)
 
 	for {
 		conn, err := ln.Accept()
@@ -1179,7 +1220,7 @@ EOF
   chmod 755 "$PROXYGO_BIN"
   "$PROXYGO_BIN" -h >/dev/null 2>&1 || return 1
   sha256sum "$PROXYGO_BIN" > "$PROXYGO_DIR/.binary.sha256"
-  printf 'NEW-GOLDEN exact-engine %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
+  printf 'NEW-GOLDEN robust-payload-v3.6 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
 }
 
 proxygo_write_shared80_service() {
@@ -1196,7 +1237,9 @@ Type=simple
 ExecStart=${PROXYGO_BIN} -listen 127.0.0.1:${PROXYGO_LOCAL_PORT} -target 127.0.0.1:${PROXYGO_TARGET_PORT} -banner "${PROXYGO_BANNER}"
 Restart=always
 RestartSec=1
-LimitNOFILE=262144
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
 KillSignal=SIGTERM
 TimeoutStartSec=15
 TimeoutStopSec=5
@@ -1225,7 +1268,9 @@ Type=simple
 ExecStart=${PROXYGO_BIN} -listen 0.0.0.0:${pub} -target 127.0.0.1:${target} -banner "${banner}"
 Restart=always
 RestartSec=1
-LimitNOFILE=262144
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
 KillSignal=SIGTERM
 TimeoutStartSec=15
 TimeoutStopSec=5
@@ -1296,7 +1341,7 @@ proxygo_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD}              PROXYGO - NEW GOLDEN (MOTOR GOLDEN MX)${C_RESET}"
+    echo -e "${C_GOLD}              PROXYGO - NEW GOLDEN ROBUST (GOLDEN COMPAT)${C_RESET}"
     bar
     if [[ -x "$PROXYGO_BIN" ]]; then echo -e " CORE        : ${C_GREEN}INSTALADO${C_RESET}"; else echo -e " CORE        : ${C_RED}NO INSTALADO${C_RESET}"; fi
     printf ' SHARED 80   : '; onoff proxygo_shared80.service
@@ -1409,17 +1454,26 @@ renew_certificate() {
 
 optimize_100_clients() {
   cat > /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf <<'EOF'
-# Perfil conservador para VPS pequeña (~100 clientes, no necesariamente 100 saturando 1Gbps).
-fs.file-max = 524288
-net.core.somaxconn = 8192
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
+# Perfil fuerte pero razonable para VPS 2 GB / ~100 clientes VPN.
+# No reserva memoria fija: los buffers TCP son limites dinamicos.
+fs.file-max = 1048576
+net.core.somaxconn = 16384
+net.core.netdev_max_backlog = 32768
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 180
+net.ipv4.tcp_keepalive_intvl = 20
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 4096 262144 16777216
+net.ipv4.tcp_wmem = 4096 262144 16777216
+vm.swappiness = 10
 EOF
   if modprobe tcp_bbr >/dev/null 2>&1 && sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
     cat >> /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf <<'EOF'
@@ -1436,7 +1490,9 @@ Wants=network-online.target
 [Service]
 Restart=always
 RestartSec=1
-LimitNOFILE=262144
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
 EOF
   cat > /etc/systemd/system/xray.service.d/99-shared-manager.conf <<'EOF'
 [Unit]
@@ -1445,11 +1501,14 @@ Wants=network-online.target
 [Service]
 Restart=always
 RestartSec=1
-LimitNOFILE=262144
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
 EOF
   systemctl daemon-reload
   enable_boot_fast
-  echo -e "${C_GREEN}Perfil conservador ~100 clientes aplicado.${C_RESET}"
+  echo -e "${C_GREEN}Perfil PROXY/VPN optimizado ~100 clientes aplicado.${C_RESET}"
+  echo 'Incluye BBR si esta disponible, colas/backlogs amplios y limites systemd elevados.'
   echo 'El limite real seguira dependiendo de CPU, cifrado y fair-share/ancho de banda del VPS.'
   [[ "${1:-}" == '--no-pause' ]] || pause
 }
@@ -1688,7 +1747,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.5 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.6 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
