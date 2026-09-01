@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.6 PROXYGO ROBUST + OPT - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.7 AUTO-TUNE MAX PERF - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -37,6 +37,19 @@ PROXYGO_BIN='/usr/local/bin/proxygo'
 PROXYGO_SRC_DIR='/opt/newgolden-proxygo'
 PROXYGO_DIR='/etc/proxygo'
 PROXYGO_LOCAL_PORT='18080'
+AUTO_TUNE_STAMP="$BASE_DIR/.auto-tune-profile"
+AUTO_TUNE_SYSCTL='/etc/sysctl.d/99-ssl-xray-proxygo-manager.conf'
+AUTO_PROFILE='AUTO'
+AUTO_CPU=1
+AUTO_MEM_MB=512
+HAPROXY_MAXCONN=8192
+AUTO_SOMAXCONN=16384
+AUTO_BACKLOG=32768
+AUTO_TCPBUF=16777216
+AUTO_FILEMAX=1048576
+AUTO_NOFILE=1048576
+AUTO_CONNTRACK=262144
+AUTO_SWAPPINESS=10
 
 DOMAIN=''
 EMAIL=''
@@ -268,6 +281,7 @@ EOF
 write_haproxy_config() {
   ensure_dirs
   load_state
+  detect_auto_tune_values
   [[ -s "$HA_CERT" ]] || make_self_signed || return 1
   backup_file_once "$HA_CFG" 'haproxy.cfg'
 
@@ -358,7 +372,7 @@ global
     daemon
     user haproxy
     group haproxy
-    maxconn 4096
+    maxconn ${HAPROXY_MAXCONN:-8192}
     ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11
     stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
 
@@ -1452,65 +1466,241 @@ renew_certificate() {
   pause
 }
 
-optimize_100_clients() {
-  cat > /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf <<'EOF'
-# Perfil fuerte pero razonable para VPS 2 GB / ~100 clientes VPN.
-# No reserva memoria fija: los buffers TCP son limites dinamicos.
-fs.file-max = 1048576
-net.core.somaxconn = 16384
-net.core.netdev_max_backlog = 32768
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_max_syn_backlog = 16384
+detect_auto_tune_values() {
+  local mem_kb cpu mem_tier cpu_tier tier
+  cpu=$(nproc 2>/dev/null || true)
+  [[ "$cpu" =~ ^[0-9]+$ && "$cpu" -ge 1 ]] || cpu=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+  [[ "$cpu" =~ ^[0-9]+$ && "$cpu" -ge 1 ]] || cpu=1
+  mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+  [[ "$mem_kb" =~ ^[0-9]+$ ]] || mem_kb=524288
+  AUTO_CPU="$cpu"
+  AUTO_MEM_MB=$((mem_kb / 1024))
+  (( AUTO_MEM_MB > 0 )) || AUTO_MEM_MB=512
+
+  # El tier efectivo usa el recurso mas limitado (CPU o RAM), para no
+  # sobreconfigurar una VPS con mucha RAM pero pocos vCPU, o al reves.
+  if (( AUTO_MEM_MB < 1536 )); then mem_tier=1
+  elif (( AUTO_MEM_MB < 4096 )); then mem_tier=2
+  elif (( AUTO_MEM_MB < 8192 )); then mem_tier=3
+  elif (( AUTO_MEM_MB < 16384 )); then mem_tier=4
+  else mem_tier=5
+  fi
+
+  if (( AUTO_CPU <= 1 )); then cpu_tier=1
+  elif (( AUTO_CPU <= 2 )); then cpu_tier=2
+  elif (( AUTO_CPU <= 4 )); then cpu_tier=3
+  elif (( AUTO_CPU <= 8 )); then cpu_tier=4
+  else cpu_tier=5
+  fi
+  (( mem_tier < cpu_tier )) && tier=$mem_tier || tier=$cpu_tier
+
+  case "$tier" in
+    1)
+      AUTO_PROFILE='MICRO'
+      HAPROXY_MAXCONN=4096
+      AUTO_SOMAXCONN=8192
+      AUTO_BACKLOG=16384
+      AUTO_TCPBUF=8388608
+      AUTO_FILEMAX=524288
+      AUTO_NOFILE=262144
+      AUTO_CONNTRACK=131072
+      AUTO_SWAPPINESS=15
+      ;;
+    2)
+      AUTO_PROFILE='SMALL'
+      HAPROXY_MAXCONN=8192
+      AUTO_SOMAXCONN=16384
+      AUTO_BACKLOG=32768
+      AUTO_TCPBUF=16777216
+      AUTO_FILEMAX=1048576
+      AUTO_NOFILE=1048576
+      AUTO_CONNTRACK=262144
+      AUTO_SWAPPINESS=10
+      ;;
+    3)
+      AUTO_PROFILE='MEDIUM'
+      HAPROXY_MAXCONN=16384
+      AUTO_SOMAXCONN=32768
+      AUTO_BACKLOG=65536
+      AUTO_TCPBUF=33554432
+      AUTO_FILEMAX=2097152
+      AUTO_NOFILE=1048576
+      AUTO_CONNTRACK=524288
+      AUTO_SWAPPINESS=5
+      ;;
+    4)
+      AUTO_PROFILE='LARGE'
+      HAPROXY_MAXCONN=32768
+      AUTO_SOMAXCONN=65535
+      AUTO_BACKLOG=131072
+      AUTO_TCPBUF=67108864
+      AUTO_FILEMAX=4194304
+      AUTO_NOFILE=1048576
+      AUTO_CONNTRACK=1048576
+      AUTO_SWAPPINESS=5
+      ;;
+    *)
+      AUTO_PROFILE='XLARGE'
+      HAPROXY_MAXCONN=65535
+      AUTO_SOMAXCONN=65535
+      AUTO_BACKLOG=262144
+      AUTO_TCPBUF=67108864
+      AUTO_FILEMAX=8388608
+      AUTO_NOFILE=1048576
+      AUTO_CONNTRACK=2097152
+      AUTO_SWAPPINESS=1
+      ;;
+  esac
+}
+
+auto_tune_signature() {
+  detect_auto_tune_values
+  printf '%s|cpu=%s|mem=%s|kernel=%s|hp=%s|backlog=%s|buf=%s' \
+    "$AUTO_PROFILE" "$AUTO_CPU" "$AUTO_MEM_MB" "$(uname -r 2>/dev/null || echo unknown)" \
+    "$HAPROXY_MAXCONN" "$AUTO_BACKLOG" "$AUTO_TCPBUF"
+}
+
+optimize_auto_vps() {
+  local quiet=0 no_pause=0 signature available_cc bbr_enabled=0 f
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet) quiet=1 ;;
+      --no-pause) no_pause=1 ;;
+    esac
+    shift
+  done
+
+  detect_auto_tune_values
+  signature=$(auto_tune_signature)
+
+  cat > "$AUTO_TUNE_SYSCTL" <<EOF
+# AUTO-TUNE V3.7 - generado segun recursos reales de la VPS.
+# Perfil: ${AUTO_PROFILE} | CPU: ${AUTO_CPU} | RAM: ${AUTO_MEM_MB} MiB
+# Los buffers TCP son MAXIMOS dinamicos; no se reservan completos por conexion.
+fs.file-max = ${AUTO_FILEMAX}
+fs.nr_open = ${AUTO_NOFILE}
+net.core.somaxconn = ${AUTO_SOMAXCONN}
+net.core.netdev_max_backlog = ${AUTO_BACKLOG}
+net.core.rmem_max = ${AUTO_TCPBUF}
+net.core.wmem_max = ${AUTO_TCPBUF}
+net.ipv4.tcp_max_syn_backlog = ${AUTO_SOMAXCONN}
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 180
-net.ipv4.tcp_keepalive_intvl = 20
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_rmem = 4096 262144 16777216
-net.ipv4.tcp_wmem = 4096 262144 16777216
-vm.swappiness = 10
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_rmem = 4096 262144 ${AUTO_TCPBUF}
+net.ipv4.tcp_wmem = 4096 262144 ${AUTO_TCPBUF}
+vm.swappiness = ${AUTO_SWAPPINESS}
 EOF
-  if modprobe tcp_bbr >/dev/null 2>&1 && sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    cat >> /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf <<'EOF'
+
+  # FQ reduce colas entre flujos. BBR se activa solo cuando el kernel realmente
+  # lo ofrece; si no, se conserva el congestion-control del sistema y solo FQ.
+  modprobe tcp_bbr >/dev/null 2>&1 || true
+  available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  if grep -qw bbr <<<"$available_cc"; then
+    cat >> "$AUTO_TUNE_SYSCTL" <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
+    bbr_enabled=1
+  else
+    cat >> "$AUTO_TUNE_SYSCTL" <<'EOF'
+net.core.default_qdisc = fq
+EOF
   fi
+
+  # Conntrack solo si el kernel expone ese parametro. Ayuda en hosts con muchas
+  # conexiones concurrentes sin asumir que todos los VPS cargan netfilter igual.
+  if sysctl -a 2>/dev/null | grep -q '^net.netfilter.nf_conntrack_max '; then
+    printf 'net.netfilter.nf_conntrack_max = %s\n' "$AUTO_CONNTRACK" >> "$AUTO_TUNE_SYSCTL"
+  fi
+
   sysctl --system >/dev/null 2>&1 || true
+
   mkdir -p /etc/systemd/system/haproxy.service.d /etc/systemd/system/xray.service.d
-  cat > /etc/systemd/system/haproxy.service.d/99-shared-manager.conf <<'EOF'
+  cat > /etc/systemd/system/haproxy.service.d/99-shared-manager.conf <<EOF
 [Unit]
 After=network-online.target
 Wants=network-online.target
 [Service]
 Restart=always
 RestartSec=1
-LimitNOFILE=1048576
-LimitNPROC=1048576
+LimitNOFILE=${AUTO_NOFILE}
+LimitNPROC=infinity
 TasksMax=infinity
 EOF
-  cat > /etc/systemd/system/xray.service.d/99-shared-manager.conf <<'EOF'
+  cat > /etc/systemd/system/xray.service.d/99-shared-manager.conf <<EOF
 [Unit]
 After=network-online.target
 Wants=network-online.target
 [Service]
 Restart=always
 RestartSec=1
-LimitNOFILE=1048576
-LimitNPROC=1048576
+LimitNOFILE=${AUTO_NOFILE}
+LimitNPROC=infinity
 TasksMax=infinity
 EOF
-  systemctl daemon-reload
-  enable_boot_fast
-  echo -e "${C_GREEN}Perfil PROXY/VPN optimizado ~100 clientes aplicado.${C_RESET}"
-  echo 'Incluye BBR si esta disponible, colas/backlogs amplios y limites systemd elevados.'
-  echo 'El limite real seguira dependiendo de CPU, cifrado y fair-share/ancho de banda del VPS.'
-  [[ "${1:-}" == '--no-pause' ]] || pause
+
+  # Aplicar los mismos limites a ProxyGo ya instalado sin cambiar su motor.
+  for f in /etc/systemd/system/proxygo_shared80.service /etc/systemd/system/proxygo_[0-9]*.service; do
+    [[ -e "$f" ]] || continue
+    mkdir -p "/etc/systemd/system/$(basename "$f").d"
+    cat > "/etc/systemd/system/$(basename "$f").d/99-auto-tune.conf" <<EOF
+[Service]
+LimitNOFILE=${AUTO_NOFILE}
+LimitNPROC=infinity
+TasksMax=infinity
+EOF
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # Si HAProxy ya estaba instalado desde una version anterior, ajustar SOLO su
+  # limite global maxconn al perfil detectado y recargar sin tocar las ACL/rutas.
+  if [[ -s "$HA_CFG" ]] && command -v haproxy >/dev/null 2>&1; then
+    local ha_tmp
+    ha_tmp=$(mktemp)
+    cp -a "$HA_CFG" "$ha_tmp" 2>/dev/null || true
+    sed -i "0,/^[[:space:]]*maxconn[[:space:]][0-9][0-9]*/s//    maxconn ${HAPROXY_MAXCONN}/" "$HA_CFG" 2>/dev/null || true
+    if haproxy -c -f "$HA_CFG" >/dev/null 2>&1; then
+      systemctl reload haproxy >/dev/null 2>&1 || true
+    elif [[ -s "$ha_tmp" ]]; then
+      cp -a "$ha_tmp" "$HA_CFG" >/dev/null 2>&1 || true
+    fi
+    rm -f "$ha_tmp"
+  fi
+
+  printf '%s\n' "$signature" > "$AUTO_TUNE_STAMP"
+  chmod 600 "$AUTO_TUNE_STAMP" 2>/dev/null || true
+
+  if (( quiet == 0 )); then
+    echo -e "${C_GREEN}AUTO-TUNE aplicado segun el hardware real de esta VPS.${C_RESET}"
+    echo "Perfil       : $AUTO_PROFILE"
+    echo "CPU / RAM    : ${AUTO_CPU} vCPU / ${AUTO_MEM_MB} MiB"
+    echo "HAProxy max  : ${HAPROXY_MAXCONN} conexiones concurrentes (limite de configuracion)"
+    echo "Backlog      : ${AUTO_BACKLOG}"
+    echo "TCP buf max  : $((AUTO_TCPBUF / 1024 / 1024)) MiB dinamicos"
+    echo "NOFILE       : ${AUTO_NOFILE} por servicio"
+    if (( bbr_enabled == 1 )); then echo 'Colas/CC     : FQ + BBR'; else echo 'Colas/CC     : FQ + congestion-control del kernel'; fi
+    echo 'Objetivo     : alta concurrencia + baja latencia bajo carga, sin reservar RAM fija.'
+    echo 'Nota         : el ping base depende de distancia/ruta/ISP; ningun sysctl puede reducir esa latencia fisica.'
+  fi
+  (( no_pause == 1 )) || pause
+}
+
+auto_optimize_if_needed() {
+  local current previous
+  current=$(auto_tune_signature)
+  previous=$(cat "$AUTO_TUNE_STAMP" 2>/dev/null || true)
+  if [[ "$current" != "$previous" || ! -s "$AUTO_TUNE_SYSCTL" ]]; then
+    optimize_auto_vps --quiet --no-pause >/dev/null 2>&1 || true
+  fi
 }
 
 enable_boot_fast() {
@@ -1598,7 +1788,7 @@ install_everything() {
   proxygo_write_shared80_service || { pause; return 0; }
   build_xray_config || { pause; return 0; }
   write_haproxy_config || { pause; return 0; }
-  optimize_100_clients --no-pause >/dev/null 2>&1 || true
+  optimize_auto_vps --quiet --no-pause >/dev/null 2>&1 || true
   enable_boot_fast
   write_info_file
   echo -e "${C_GREEN}INSTALACION BASE COMPLETA: 443 + 80 COMPARTIDOS.${C_RESET}"
@@ -1770,7 +1960,7 @@ main_menu() {
     echo '[12] ESTADO GENERAL / PUERTOS'
     echo '[13] DIAGNOSTICO'
     echo '[14] REINICIAR SERVICIOS'
-    echo '[15] OPTIMIZAR VPS ~100 CLIENTES'
+    echo '[15] REAPLICAR AUTO-OPTIMIZACION SEGUN HARDWARE'
     echo '[16] AUTO-BOOT / LEVANTAR PUERTOS AL REINICIAR'
     echo '[17] DESINSTALAR SOLO XRAY'
     echo '[18] DESINSTALAR TODO EL MANAGER'
@@ -1792,7 +1982,7 @@ main_menu() {
       12) status_general ;;
       13) diagnostics ;;
       14) restart_services ;;
-      15) optimize_100_clients ;;
+      15) optimize_auto_vps ;;
       16) boot_test ;;
       17) uninstall_xray_only ;;
       18) uninstall_all ;;
@@ -1805,4 +1995,5 @@ main_menu() {
 require_root
 ensure_dirs
 load_state
+auto_optimize_if_needed
 main_menu
