@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V4.3 PROXYGO SSH COMPAT FIX - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V4.4 LATENCY + KEEPALIVE CANDIDATE - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -384,6 +384,7 @@ defaults
     log global
     mode tcp
     option tcplog
+    option tcpka
     timeout connect 5s
     timeout client  2h
     timeout server  2h
@@ -397,7 +398,7 @@ defaults
 frontend shared_ssl_v2ray_443
     bind *:443 ssl crt ${HA_CERT} alpn h2,http/1.1
     mode tcp
-    tcp-request inspect-delay 3s
+    tcp-request inspect-delay 400ms
     acl enough_payload req.len ge 4
     acl is_ssh req.payload(0,4) -m str SSH-
     tcp-request content accept if enough_payload
@@ -422,7 +423,7 @@ backend xray_selected
 frontend shared_proxygo_v2ray_80
     bind *:80
     mode tcp
-    tcp-request inspect-delay 500ms
+    tcp-request inspect-delay 200ms
 ${x80_acl}
     default_backend proxygo_80
 
