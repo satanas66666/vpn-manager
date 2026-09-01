@@ -37,6 +37,10 @@ PROXYGO_BIN='/usr/local/bin/proxygo'
 PROXYGO_SRC_DIR='/opt/newgolden-proxygo'
 PROXYGO_DIR='/etc/proxygo'
 PROXYGO_LOCAL_PORT='18080'
+SHARED80_DIR='/opt/multi80-shared-router'
+SHARED80_BIN='/usr/local/bin/multi80-shared-router'
+SHARED80_CFG='/etc/multi80-shared-router.json'
+SHARED80_SERVICE='/etc/systemd/system/shared80_router.service'
 AUTO_TUNE_STAMP="$BASE_DIR/.auto-tune-profile"
 AUTO_TUNE_SYSCTL='/etc/sysctl.d/99-ssl-xray-proxygo-manager.conf'
 AUTO_PROFILE='AUTO'
@@ -285,86 +289,9 @@ write_haproxy_config() {
   [[ -s "$HA_CERT" ]] || make_self_signed || return 1
   backup_file_once "$HA_CFG" 'haproxy.cfg'
 
-  local x80_acl=''
-  local x80_backend=''
-  if [[ "$XRAY80_ENABLED" == '1' ]]; then
-    # PORT 80 SHARING FIX:
-    # ProxyGo NEW GOLDEN remains the default/backend and is not modified.
-    # Xray traffic is identified by the transport signature instead of relying
-    # only on the literal Path. This is required because Xray normalizes an
-    # HTTP path without a leading slash (e.g. alex -> /alex) and HTTP clients
-    # percent-encode spaces/UTF-8 on the wire.
-    local route_path route_path_no_query route_path_uri
-    route_path_no_query="${XRAY80_PATH%%\?*}"
-    [[ -n "$route_path_no_query" ]] || route_path_no_query='/'
-    [[ "$route_path_no_query" == /* ]] || route_path_no_query="/$route_path_no_query"
-    route_path_uri=$(jq -nr --arg v "$route_path_no_query" '$v|@uri')
-    route_path_uri="${route_path_uri//%2F//}"
-
-    case "$XRAY80_TRANSPORT" in
-      websocket)
-        # Genuine Xray WebSocket must match BOTH its normalized wire Path and
-        # the WebSocket handshake (including Sec-WebSocket-Key).  ProxyGo stays
-        # the default backend, so generic HTTP injector payloads containing
-        # "Upgrade: websocket" are not stolen by Xray.
-        x80_acl=$(cat <<EOF
-    acl is_xray80_path    req.payload(0,0) -m sub -i " ${route_path_uri}"
-    acl is_xray80_upgrade req.payload(0,0) -m sub -i "Upgrade: websocket"
-    acl is_xray80_wskey   req.payload(0,0) -m sub -i "Sec-WebSocket-Key:"
-    tcp-request content accept if is_xray80_path is_xray80_upgrade is_xray80_wskey
-    use_backend xray_80 if is_xray80_path is_xray80_upgrade is_xray80_wskey
-EOF
-)
-        ;;
-      httpupgrade)
-        # HTTPUpgrade does not require the WebSocket key used by real WS.
-        # Keep the configured wire Path in the discriminator so ProxyGo remains
-        # the fallback for unrelated/custom Upgrade payloads.
-        x80_acl=$(cat <<EOF
-    acl is_xray80_path    req.payload(0,0) -m sub -i " ${route_path_uri}"
-    acl is_xray80_upgrade req.payload(0,0) -m sub -i "Upgrade: websocket"
-    acl is_xray80_connup  req.payload(0,0) -m sub -i "Connection: Upgrade"
-    tcp-request content accept if is_xray80_path is_xray80_upgrade is_xray80_connup
-    use_backend xray_80 if is_xray80_path is_xray80_upgrade is_xray80_connup
-EOF
-)
-        ;;
-      grpc)
-        x80_acl=$(cat <<'EOF'
-    acl is_xray80_h2 req.payload(0,14) -m str "PRI * HTTP/2.0"
-    tcp-request content accept if is_xray80_h2
-    use_backend xray_80 if is_xray80_h2
-EOF
-)
-        ;;
-      xhttp)
-        # XHTTP can arrive over HTTP/1.1 or HTTP/2. For HTTP/1.1 match the
-        # normalized percent-encoded wire path; for h2 route by the preface.
-        x80_acl=$(cat <<EOF
-    acl is_xray80_path req.payload(0,0) -m sub -i " ${route_path_uri}"
-    acl is_xray80_h2 req.payload(0,14) -m str "PRI * HTTP/2.0"
-    tcp-request content accept if is_xray80_path
-    tcp-request content accept if is_xray80_h2
-    use_backend xray_80 if is_xray80_path
-    use_backend xray_80 if is_xray80_h2
-EOF
-)
-        ;;
-      *)
-        echo 'ERROR: transporte Xray80 no soportado para sharing en 80.' >&2
-        return 1
-        ;;
-    esac
-
-    x80_backend=$(cat <<EOF
-
-backend xray_80
-    mode tcp
-    server xray80 127.0.0.1:${XRAY80_PORT} check
-EOF
-)
-  fi
-
+  # V4.2: HAProxy conserva EXCLUSIVAMENTE el 443 estable.
+  # El puerto 80 ya no pasa por HAProxy para no alterar la segmentacion
+  # que espera PROXYGO NEW GOLDEN. Lo atiende shared80_router.service.
   cat > "$HA_CFG" <<EOF
 global
     log /dev/log local0
@@ -386,7 +313,7 @@ defaults
     timeout tunnel  24h
 
 # ---------------------------------------------------------------
-# TCP/443 COMPARTIDO
+# TCP/443 COMPARTIDO - INTACTO
 # HAProxy termina TLS. SSH comienza con SSH- y va a OpenSSH.
 # Todo otro payload va al perfil Xray 443.
 # ---------------------------------------------------------------
@@ -408,23 +335,6 @@ backend ssh_direct
 backend xray_selected
     mode tcp
     server xray1 127.0.0.1:${XRAY_PORT} check
-
-# ---------------------------------------------------------------
-# TCP/80 COMPARTIDO
-# ProxyGo NEW GOLDEN es el backend por defecto.
-# Solo el path Xray configurado / h2c se desvia a Xray local.
-# Esto preserva el comportamiento ProxyGo que ya funciona en Golden MX.
-# ---------------------------------------------------------------
-frontend shared_proxygo_v2ray_80
-    bind *:80
-    mode tcp
-    tcp-request inspect-delay 500ms
-${x80_acl}
-    default_backend proxygo_80
-
-backend proxygo_80
-    mode tcp
-    server proxygo1 127.0.0.1:${PROXYGO_LOCAL_PORT} check${x80_backend}
 EOF
 
   if ! haproxy -c -f "$HA_CFG"; then
@@ -433,6 +343,12 @@ EOF
   fi
   systemctl enable haproxy >/dev/null 2>&1 || true
   systemctl restart haproxy || return 1
+
+  # Si el router 80 ya existe, sincronizar Path/transporte sin tocar 443.
+  if declare -F write_shared80_router_config >/dev/null 2>&1; then
+    write_shared80_router_config >/dev/null 2>&1 || true
+    [[ -f "$SHARED80_SERVICE" ]] && systemctl restart shared80_router.service >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
@@ -1112,207 +1028,411 @@ proxygo_compile_golden() {
 package main
 
 import (
-    "bytes"
-    "flag"
-    "fmt"
-    "io"
-    "net"
-    "time"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"time"
 )
 
-const sshGateTimeout = 15 * time.Second
-
-// findSSHIdentification returns the first real SSH identification line.  It
-// only accepts SSH-2.0- at the beginning of a line so payload text containing
-// those characters elsewhere cannot be mistaken for the SSH handshake.
-func findSSHIdentification(b []byte) int {
-    needle := []byte("SSH-2.0-")
-    from := 0
-    for {
-        i := bytes.Index(b[from:], needle)
-        if i < 0 {
-            return -1
-        }
-        i += from
-        if i == 0 || b[i-1] == '\n' {
-            return i
-        }
-        from = i + 1
-        if from >= len(b) {
-            return -1
-        }
-    }
-}
-
-// forwardServerIdentification forwards the SSH server banner immediately.
-// If sshd coalesces KEX bytes in the same TCP read they are forwarded too;
-// the SSH client is allowed to receive them right after the identification.
-func forwardServerIdentification(server, client net.Conn) error {
-    _ = server.SetReadDeadline(time.Now().Add(sshGateTimeout))
-    defer server.SetReadDeadline(time.Time{})
-
-    buf := make([]byte, 4096)
-    acc := make([]byte, 0, 4096)
-    for len(acc) < 64*1024 {
-        n, err := server.Read(buf)
-        if n > 0 {
-            acc = append(acc, buf[:n]...)
-            if idx := bytes.Index(acc, []byte("SSH-2.0-")); idx >= 0 {
-                if eol := bytes.IndexByte(acc[idx:], '\n'); eol >= 0 {
-                    _, werr := client.Write(acc)
-                    return werr
-                }
-            }
-        }
-        if err != nil {
-            return err
-        }
-    }
-    return fmt.Errorf("SSH server identification too large")
-}
-
-// forwardClientFromSSHIdentification is the key compatibility gate for
-// HAProxy/shared :80.  Anything HTTP Custom sends before its actual SSH
-// identification is injector residue and is discarded.  Only from the real
-// SSH-2.0- line onward is allowed to reach sshd.
-func forwardClientFromSSHIdentification(client, server net.Conn, initial []byte) error {
-    _ = client.SetReadDeadline(time.Now().Add(sshGateTimeout))
-    defer client.SetReadDeadline(time.Time{})
-
-    acc := append([]byte(nil), initial...)
-    buf := make([]byte, 4096)
-
-    for len(acc) < 256*1024 {
-        if idx := findSSHIdentification(acc); idx >= 0 {
-            _, err := server.Write(acc[idx:])
-            return err
-        }
-
-        n, err := client.Read(buf)
-        if n > 0 {
-            acc = append(acc, buf[:n]...)
-        }
-        if err != nil {
-            return err
-        }
-    }
-    return fmt.Errorf("SSH client identification not found")
-}
-
 func handle(client net.Conn, target string, banner string) {
-    defer client.Close()
+	defer client.Close()
 
-    if tcp, ok := client.(*net.TCPConn); ok {
-        _ = tcp.SetNoDelay(true)
-        _ = tcp.SetKeepAlive(true)
-        _ = tcp.SetKeepAlivePeriod(60 * time.Second)
-    }
+	if tcp, ok := client.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+	}
 
-    if banner == "" {
-        banner = "OK"
-    }
+	if banner == "" {
+		banner = "OK"
+	}
 
-    // Public behavior kept identical to PROXYGO NEW GOLDEN.
-    if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
-        return
-    }
+	// Primera respuesta fija
+	_, _ = client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n"))
 
-    // Keep Golden's original one-read injector consumption.  Unlike Golden,
-    // any fragment that arrives later is still filtered by the SSH gate below,
-    // so it can never contaminate sshd.
-    first := make([]byte, 1024)
-    _ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
-    nFirst, _ := client.Read(first)
-    _ = client.SetReadDeadline(time.Time{})
-    first = first[:max(0, nFirst)]
+	// Leer y tirar payload inicial para que NO llegue al SSH
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buffer := make([]byte, 1024)
+	_, _ = client.Read(buffer)
+	client.SetReadDeadline(time.Time{})
 
-    if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
-        return
-    }
+	// Aquí aparece el banner
+	_, _ = client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner)))
 
-    server, err := net.DialTimeout("tcp", target, 10*time.Second)
-    if err != nil {
-        return
-    }
-    defer server.Close()
+	server, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer server.Close()
 
-    if tcp, ok := server.(*net.TCPConn); ok {
-        _ = tcp.SetNoDelay(true)
-        _ = tcp.SetKeepAlive(true)
-        _ = tcp.SetKeepAlivePeriod(60 * time.Second)
-    }
+	if tcp, ok := server.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+	}
 
-    // Let HTTP Custom see the real SSH server banner first, exactly as in a
-    // normal SSH connection.  Do not start raw client->server copying yet.
-    if err := forwardServerIdentification(server, client); err != nil {
-        return
-    }
+	done := make(chan struct{}, 2)
 
-    // If the initial Golden read already contained an early SSH identification,
-    // preserve it; otherwise discard it as injector payload.  Then keep reading
-    // and discard ALL remaining HTTP residue until the real SSH identification
-    // arrives.  Only SSH bytes are ever sent to sshd.
-    initialSSH := []byte(nil)
-    if idx := findSSHIdentification(first); idx >= 0 {
-        initialSSH = first[idx:]
-    }
-    if err := forwardClientFromSSHIdentification(client, server, initialSSH); err != nil {
-        return
-    }
+	go func() {
+		_, _ = io.Copy(server, client)
+		done <- struct{}{}
+	}()
 
-    done := make(chan struct{}, 2)
-    go func() {
-        _, _ = io.Copy(server, client)
-        done <- struct{}{}
-    }()
-    go func() {
-        _, _ = io.Copy(client, server)
-        done <- struct{}{}
-    }()
-    <-done
-}
+	go func() {
+		_, _ = io.Copy(client, server)
+		done <- struct{}{}
+	}()
 
-func max(a, b int) int {
-    if a > b { return a }
-    return b
+	<-done
 }
 
 func main() {
-    listen := flag.String("listen", "0.0.0.0:80", "listen address")
-    target := flag.String("target", "127.0.0.1:22", "target address")
-    banner := flag.String("banner", "OK", "banner en respuesta 200")
-    flag.Parse()
+	listen := flag.String("listen", "0.0.0.0:80", "listen address")
+	target := flag.String("target", "127.0.0.1:22", "target address")
+	banner := flag.String("banner", "OK", "banner en respuesta 200")
+	flag.Parse()
 
-    ln, err := net.Listen("tcp", *listen)
-    if err != nil {
-        panic(err)
-    }
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		panic(err)
+	}
 
-    fmt.Println("ProxyGo NEW GOLDEN SSH-GATE ONLINE", *listen, "->", *target, "BANNER:", *banner)
+	fmt.Println("ProxyGo ONLINE", *listen, "->", *target, "BANNER:", *banner)
 
-    for {
-        conn, err := ln.Accept()
-        if err != nil {
-            time.Sleep(50 * time.Millisecond)
-            continue
-        }
-        go handle(conn, *target, *banner)
-    }
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+		go handle(conn, *target, *banner)
+	}
 }
 EOF
   (cd "$PROXYGO_SRC_DIR" && go build -ldflags='-s -w' -o "$PROXYGO_BIN" main.go) || return 1
   chmod 755 "$PROXYGO_BIN"
   "$PROXYGO_BIN" -h >/dev/null 2>&1 || return 1
   sha256sum "$PROXYGO_BIN" > "$PROXYGO_DIR/.binary.sha256"
-  printf 'NEW-GOLDEN ssh-gate-v4.0 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
+  printf 'NEW-GOLDEN robust-payload-v3.6 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
 }
+
+# =====================================================================
+# V4.2 PORT 80 GOLDEN BRIDGE
+# Motivo: PROXYGO NEW GOLDEN funciona directo, pero HAProxy delante de :80
+# cambia la entrega del stream y puede separar el payload HTTP en varios Read().
+# Este router NO cambia el protocolo:
+#   - V2Ray/Xray real -> 127.0.0.1:10080
+#   - Todo lo demas  -> PROXYGO NEW GOLDEN exacto en 127.0.0.1:18080
+# Para ProxyGo, el payload de inyeccion se consume en el router y al Golden
+# local solo se le entrega 1 byte descartable para activar su Read(1024).
+# Asi ningun fragmento HTTP puede alcanzar OpenSSH.
+# =====================================================================
+write_shared80_router_config() {
+  load_state
+  local rp wire
+  rp="${XRAY80_PATH%%\?*}"
+  [[ -n "$rp" ]] || rp='/'
+  [[ "$rp" == /* ]] || rp="/$rp"
+  wire=$(jq -nr --arg v "$rp" '$v|@uri') || return 1
+  wire="${wire//%2F//}"
+
+  jq -n \
+    --argjson enabled "$([[ "$XRAY80_ENABLED" == '1' ]] && echo true || echo false)" \
+    --arg transport "$XRAY80_TRANSPORT" \
+    --arg wire_path "$wire" \
+    --arg xray_target "127.0.0.1:${XRAY80_PORT}" \
+    --arg proxy_target "127.0.0.1:${PROXYGO_LOCAL_PORT}" \
+    '{
+      xray_enabled:$enabled,
+      transport:$transport,
+      wire_path:$wire_path,
+      xray_target:$xray_target,
+      proxy_target:$proxy_target,
+      proxy_payload_quiet_ms:650,
+      proxy_payload_max_ms:3000,
+      max_initial_bytes:131072
+    }' > "$SHARED80_CFG" || return 1
+  chmod 600 "$SHARED80_CFG"
+}
+
+compile_shared80_router() {
+  install_base || return 1
+  mkdir -p "$SHARED80_DIR"
+  cat > "$SHARED80_DIR/main.go" <<'EOF'
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Config struct {
+	XrayEnabled        bool   `json:"xray_enabled"`
+	Transport          string `json:"transport"`
+	WirePath           string `json:"wire_path"`
+	XrayTarget         string `json:"xray_target"`
+	ProxyTarget        string `json:"proxy_target"`
+	ProxyPayloadQuiet  int    `json:"proxy_payload_quiet_ms"`
+	ProxyPayloadMax    int    `json:"proxy_payload_max_ms"`
+	MaxInitialBytes    int    `json:"max_initial_bytes"`
+}
+
+func loadConfig(path string) (Config, error) {
+	var c Config
+	b, err := os.ReadFile(path)
+	if err != nil { return c, err }
+	if err := json.Unmarshal(b, &c); err != nil { return c, err }
+	if c.ProxyPayloadQuiet < 100 { c.ProxyPayloadQuiet = 650 }
+	if c.ProxyPayloadMax < c.ProxyPayloadQuiet { c.ProxyPayloadMax = 3000 }
+	if c.MaxInitialBytes < 4096 { c.MaxInitialBytes = 131072 }
+	if c.ProxyTarget == "" { c.ProxyTarget = "127.0.0.1:18080" }
+	if c.XrayTarget == "" { c.XrayTarget = "127.0.0.1:10080" }
+	return c, nil
+}
+
+func tune(c net.Conn) {
+	if t, ok := c.(*net.TCPConn); ok {
+		_ = t.SetNoDelay(true)
+		_ = t.SetKeepAlive(true)
+		_ = t.SetKeepAlivePeriod(30*time.Second)
+	}
+}
+
+func firstLine(b []byte) string {
+	if i := bytes.Index(b, []byte("\r\n")); i >= 0 {
+		return string(b[:i])
+	}
+	if i := bytes.IndexByte(b, '\n'); i >= 0 {
+		return string(b[:i])
+	}
+	return string(b)
+}
+
+func pathMatches(b []byte, wire string) bool {
+	if wire == "" { return false }
+	line := firstLine(b)
+	return strings.Contains(line, " "+wire) ||
+		strings.Contains(line, " "+wire+"?") ||
+		strings.Contains(line, " "+wire+" ")
+}
+
+func isXray(c Config, b []byte) bool {
+	if !c.XrayEnabled { return false }
+	lower := strings.ToLower(string(b))
+	switch strings.ToLower(c.Transport) {
+	case "websocket":
+		return pathMatches(b, c.WirePath) &&
+			strings.Contains(lower, "upgrade: websocket") &&
+			strings.Contains(lower, "sec-websocket-key:")
+	case "httpupgrade":
+		return pathMatches(b, c.WirePath) &&
+			strings.Contains(lower, "upgrade: websocket") &&
+			strings.Contains(lower, "connection: upgrade")
+	case "grpc":
+		return bytes.HasPrefix(b, []byte("PRI * HTTP/2.0"))
+	case "xhttp":
+		return bytes.HasPrefix(b, []byte("PRI * HTTP/2.0")) || pathMatches(b, c.WirePath)
+	default:
+		return false
+	}
+}
+
+func readDecision(client net.Conn, c Config) ([]byte, bool, error) {
+	buf := make([]byte, 4096)
+	acc := make([]byte, 0, 8192)
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for len(acc) < c.MaxInitialBytes {
+		if time.Now().After(deadline) { break }
+		_ = client.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+		n, err := client.Read(buf)
+		if n > 0 {
+			acc = append(acc, buf[:n]...)
+			if isXray(c, acc) {
+				_ = client.SetReadDeadline(time.Time{})
+				return acc, true, nil
+			}
+			// Un primer bloque HTTP completo sin firma Xray ya es ProxyGo.
+			if bytes.Contains(acc, []byte("\r\n\r\n")) {
+				_ = client.SetReadDeadline(time.Time{})
+				return acc, false, nil
+			}
+			// HTTP/2 se decide apenas hay preface suficiente.
+			if len(acc) >= 14 && bytes.HasPrefix(acc, []byte("PRI * HTTP/2.0")) {
+				_ = client.SetReadDeadline(time.Time{})
+				return acc, isXray(c, acc), nil
+			}
+		}
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if len(acc) > 0 { break }
+				continue
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			return acc, false, err
+		}
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	if len(acc) == 0 { return nil, false, errors.New("sin datos iniciales") }
+	return acc, isXray(c, acc), nil
+}
+
+func copyBoth(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func(){ defer wg.Done(); _, _ = io.Copy(a,b) }()
+	go func(){ defer wg.Done(); _, _ = io.Copy(b,a) }()
+	wg.Wait()
+}
+
+func routeXray(client net.Conn, target string, initial []byte) {
+	up, err := net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil { return }
+	defer up.Close()
+	tune(up)
+	if len(initial) > 0 {
+		if _, err = up.Write(initial); err != nil { return }
+	}
+	copyBoth(up, client)
+}
+
+func readHeader(conn net.Conn, max int, timeout time.Duration) ([]byte,error) {
+	buf := make([]byte,1024)
+	acc := make([]byte,0,1024)
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+	for len(acc)<max {
+		n,err:=conn.Read(buf)
+		if n>0 {
+			acc=append(acc,buf[:n]...)
+			if bytes.Contains(acc,[]byte("\r\n\r\n")) { return acc,nil }
+		}
+		if err!=nil { return acc,err }
+	}
+	return acc,errors.New("cabecera demasiado grande")
+}
+
+// drainInjector descarta la inyeccion del cliente. initial ya fue leido para
+// decidir el protocolo. Tras el 101 de Golden, esperamos hasta que exista una
+// pausa real; el temporizador se reinicia con cada fragmento recibido.
+// SSH todavia no debe empezar porque HTTP Custom espera el 200 del proxy.
+func drainInjector(client net.Conn, initial []byte, c Config) {
+	total := len(initial)
+	start := time.Now()
+	buf := make([]byte,8192)
+	for total < c.MaxInitialBytes && time.Since(start) < time.Duration(c.ProxyPayloadMax)*time.Millisecond {
+		_ = client.SetReadDeadline(time.Now().Add(time.Duration(c.ProxyPayloadQuiet)*time.Millisecond))
+		n,err:=client.Read(buf)
+		if n>0 { total += n }
+		if err!=nil {
+			if ne,ok:=err.(net.Error); ok && ne.Timeout() { break }
+			break
+		}
+	}
+	_ = client.SetReadDeadline(time.Time{})
+}
+
+func routeProxy(client net.Conn, c Config, initial []byte) {
+	// El proceso local es el PROXYGO NEW GOLDEN original exacto.
+	pg,err:=net.DialTimeout("tcp",c.ProxyTarget,3*time.Second)
+	if err!=nil { return }
+	defer pg.Close()
+	tune(pg)
+
+	// Golden envia 101 inmediatamente. Se reenvia byte-identico al cliente.
+	r101,err:=readHeader(pg,4096,3*time.Second)
+	if err!=nil { return }
+	if _,err=client.Write(r101); err!=nil { return }
+
+	// Consumir TODO el payload real aqui, fuera de Golden/OpenSSH.
+	drainInjector(client,initial,c)
+
+	// Golden solo necesita que su Read(1024) retorne. Un byte descartable es
+	// suficiente; el payload real jamas atraviesa a sshd.
+	if _,err=pg.Write([]byte{'\n'}); err!=nil { return }
+
+	// Desde aqui Golden produce 200 y abre SSH exactamente como el original.
+	copyBoth(pg,client)
+}
+
+func handle(client net.Conn, cfgPath string) {
+	defer client.Close()
+	tune(client)
+	c,err:=loadConfig(cfgPath)
+	if err!=nil { return }
+	initial,xray,err:=readDecision(client,c)
+	if err!=nil { return }
+	if xray { routeXray(client,c.XrayTarget,initial); return }
+	routeProxy(client,c,initial)
+}
+
+func main(){
+	listen:=flag.String("listen","0.0.0.0:80","listen address")
+	cfg:=flag.String("config","/etc/multi80-shared-router.json","config file")
+	flag.Parse()
+	ln,err:=net.Listen("tcp",*listen)
+	if err!=nil { panic(err) }
+	fmt.Println("MULTI80 GOLDEN BRIDGE ONLINE",*listen)
+	for {
+		c,err:=ln.Accept()
+		if err!=nil { continue }
+		go handle(c,*cfg)
+	}
+}
+EOF
+  (cd "$SHARED80_DIR" && go build -ldflags='-s -w' -o "$SHARED80_BIN" main.go) || return 1
+  chmod 755 "$SHARED80_BIN"
+  "$SHARED80_BIN" -h >/dev/null 2>&1 || return 1
+}
+
+write_shared80_router_service() {
+  write_shared80_router_config || return 1
+  [[ -x "$SHARED80_BIN" ]] || compile_shared80_router || return 1
+  cat > "$SHARED80_SERVICE" <<EOF
+[Unit]
+Description=Port 80 Golden Bridge - ProxyGo exact + Xray
+After=network-online.target proxygo_shared80.service xray.service
+Wants=network-online.target
+Requires=proxygo_shared80.service
+
+[Service]
+Type=simple
+ExecStart=${SHARED80_BIN} -listen 0.0.0.0:80 -config ${SHARED80_CFG}
+Restart=always
+RestartSec=1
+LimitNOFILE=1048576
+LimitNPROC=1048576
+TasksMax=infinity
+KillSignal=SIGTERM
+TimeoutStartSec=15
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable shared80_router.service >/dev/null 2>&1 || true
+  systemctl restart shared80_router.service || return 1
+}
+
 
 proxygo_write_shared80_service() {
   load_state
   [[ -x "$PROXYGO_BIN" ]] || proxygo_compile_golden || return 1
+
+  # Golden exacto queda LOCAL en 18080; nunca recibe directamente el payload
+  # externo. El router publico :80 preserva su comportamiento sin contaminacion.
   cat > /etc/systemd/system/proxygo_shared80.service <<EOF
 [Unit]
-Description=ProxyGo NEW GOLDEN shared public 80 backend
+Description=ProxyGo NEW GOLDEN exact local backend for shared 80
 After=network-online.target ssh.service
 Wants=network-online.target
 
@@ -1332,8 +1452,15 @@ TimeoutStopSec=5
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now proxygo_shared80.service >/dev/null 2>&1 || return 1
-  write_haproxy_config >/dev/null 2>&1 || true
+  systemctl enable proxygo_shared80.service >/dev/null 2>&1 || true
+  systemctl restart proxygo_shared80.service || return 1
+
+  compile_shared80_router || return 1
+
+  # Primero liberar el :80 de HAProxy; despues levantar el Golden Bridge.
+  # Este orden evita cualquier carrera/bind conflict durante una actualizacion.
+  write_haproxy_config >/dev/null 2>&1 || return 1
+  write_shared80_router_service || return 1
 }
 
 proxygo_write_extra_service() {
@@ -1394,6 +1521,7 @@ proxygo_extra_close() {
 
 proxygo_restart_all() {
   local u
+  systemctl restart shared80_router.service >/dev/null 2>&1 || true
   for u in proxygo_shared80.service /etc/systemd/system/proxygo_[0-9]*.service; do
     [[ "$u" == /* ]] && u=$(basename "$u")
     systemctl cat "$u" >/dev/null 2>&1 || continue
@@ -1405,12 +1533,16 @@ proxygo_uninstall() {
   read -r -p 'Escribe SI para desinstalar ProxyGo: ' ok
   [[ "$ok" == 'SI' ]] || return
   local f
+  systemctl disable --now shared80_router.service >/dev/null 2>&1 || true
   systemctl disable --now proxygo_shared80.service >/dev/null 2>&1 || true
   for f in /etc/systemd/system/proxygo_[0-9]*.service; do
     [[ -e "$f" ]] || continue
     systemctl disable --now "$(basename "$f")" >/dev/null 2>&1 || true
   done
+  rm -f "$SHARED80_SERVICE" "$SHARED80_CFG" "$SHARED80_BIN"
+  rm -rf "$SHARED80_DIR"
   rm -f /etc/systemd/system/proxygo_shared80.service /etc/systemd/system/proxygo_[0-9]*.service
+  pkill -x multi80-shared-router >/dev/null 2>&1 || true
   pkill -x proxygo >/dev/null 2>&1 || true
   rm -f "$PROXYGO_BIN"
   rm -rf "$PROXYGO_SRC_DIR" "$PROXYGO_DIR"
@@ -1425,13 +1557,13 @@ proxygo_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD}              PROXYGO - NEW GOLDEN ROBUST (GOLDEN COMPAT)${C_RESET}"
+    echo -e "${C_GOLD}              PROXYGO - NEW GOLDEN (GOLDEN BRIDGE)${C_RESET}"
     bar
     if [[ -x "$PROXYGO_BIN" ]]; then echo -e " CORE        : ${C_GREEN}INSTALADO${C_RESET}"; else echo -e " CORE        : ${C_RED}NO INSTALADO${C_RESET}"; fi
     printf ' SHARED 80   : '; onoff proxygo_shared80.service
     echo " BACKEND     : 127.0.0.1:${PROXYGO_TARGET_PORT}"
     echo " BANNER      : ${PROXYGO_BANNER}"
-    echo ' PUBLICO 80  : HAProxy -> ProxyGo local 18080 (default)'
+    echo ' PUBLICO 80  : Golden Bridge -> ProxyGo local 18080 / Xray 10080'
     bar
     echo '[1] INSTALAR / REPARAR PROXYGO GOLDEN'
     echo '[2] ACTIVAR / REPARAR PROXYGO EN 80 COMPARTIDO'
@@ -1778,12 +1910,14 @@ enable_boot_fast() {
   systemctl enable haproxy >/dev/null 2>&1 || true
   [[ -f /etc/systemd/system/xray.service || -f /lib/systemd/system/xray.service ]] && systemctl enable xray >/dev/null 2>&1 || true
   [[ -f /etc/systemd/system/proxygo_shared80.service ]] && systemctl enable proxygo_shared80 >/dev/null 2>&1 || true
+  [[ -f "$SHARED80_SERVICE" ]] && systemctl enable shared80_router >/dev/null 2>&1 || true
   local f
   for f in /etc/systemd/system/proxygo_[0-9]*.service; do [[ -e "$f" ]] && systemctl enable "$(basename "$f")" >/dev/null 2>&1 || true; done
   systemctl daemon-reload
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
   [[ -f /etc/systemd/system/xray.service || -f /lib/systemd/system/xray.service ]] && systemctl restart xray >/dev/null 2>&1 || true
   [[ -f /etc/systemd/system/proxygo_shared80.service ]] && systemctl restart proxygo_shared80 >/dev/null 2>&1 || true
+  [[ -f "$SHARED80_SERVICE" ]] && systemctl restart shared80_router >/dev/null 2>&1 || true
   systemctl restart haproxy >/dev/null 2>&1 || true
 }
 
@@ -1796,6 +1930,7 @@ boot_test() {
   systemctl is-enabled haproxy 2>/dev/null || true
   systemctl is-enabled xray 2>/dev/null || true
   systemctl is-enabled proxygo_shared80 2>/dev/null || true
+  systemctl is-enabled shared80_router 2>/dev/null || true
   echo
   ss -lntp 2>/dev/null | grep -E '(:80|:443|:10000|:10080|:18080)([[:space:]]|$)' || true
   bar
@@ -1824,7 +1959,7 @@ write_info_file() {
     echo
     echo 'PROXYGO NEW GOLDEN'
     echo '------------------'
-    echo 'Publico  : 80 (a traves de HAProxy)'
+    echo 'Publico  : 80 (Golden Bridge; HAProxy fuera del camino)'
     echo "Local    : 127.0.0.1:${PROXYGO_LOCAL_PORT}"
     echo "Destino  : 127.0.0.1:${PROXYGO_TARGET_PORT}"
     echo "Banner   : ${PROXYGO_BANNER}"
@@ -1904,6 +2039,7 @@ uninstall_xray_only() {
 
 cleanup_proxygo_for_full_uninstall() {
   # No llamar proxygo_uninstall() aqui porque esa funcion vuelve a escribir/reiniciar HAProxy.
+  systemctl disable --now shared80_router.service 2>/dev/null || true
   systemctl disable --now proxygo_shared80.service 2>/dev/null || true
   local f unit
   for f in /etc/systemd/system/proxygo_[0-9]*.service; do
@@ -1914,6 +2050,8 @@ cleanup_proxygo_for_full_uninstall() {
   pkill -TERM -x proxygo 2>/dev/null || true
   sleep 1
   pkill -KILL -x proxygo 2>/dev/null || true
+  rm -f "$SHARED80_SERVICE" "$SHARED80_CFG" "$SHARED80_BIN"
+  rm -rf "$SHARED80_DIR"
   rm -f /etc/systemd/system/proxygo_shared80.service /etc/systemd/system/proxygo_[0-9]*.service
   rm -f "$PROXYGO_BIN"
   rm -rf "$PROXYGO_SRC_DIR" "$PROXYGO_DIR"
@@ -1978,7 +2116,7 @@ uninstall_all() {
   rm -rf "$BASE_DIR"
 
   systemctl daemon-reload
-  systemctl reset-failed haproxy.service xray.service proxygo_shared80.service 2>/dev/null || true
+  systemctl reset-failed haproxy.service xray.service proxygo_shared80.service shared80_router.service 2>/dev/null || true
 
   # Ultimo barrido solo de procesos propios por si quedaron hijos fuera de systemd.
   pkill -KILL -x xray 2>/dev/null || true
@@ -1993,6 +2131,7 @@ uninstall_all() {
   printf 'HAProxy : '; service_is_active haproxy && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
   printf 'Xray    : '; service_is_active xray && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
   printf 'ProxyGo : '; service_is_active proxygo_shared80 && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
+  printf 'Router80: '; service_is_active shared80_router && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
   show_remaining_manager_listeners || true
   bar
   echo 'Los usuarios Linux/SSH NO fueron borrados. SSH :22 queda intacto.'
@@ -2007,7 +2146,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V4.0 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V4.2 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
