@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3 - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.3.1 - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -512,9 +512,9 @@ choose_xray_profile() {
   esac
 
   if [[ "$XRAY_TRANSPORT" == 'websocket' || "$XRAY_TRANSPORT" == 'xhttp' || "$XRAY_TRANSPORT" == 'httpupgrade' ]]; then
-    read -r -p "Path [${XRAY_PATH}]: " p
-    if [[ -n "$p" ]]; then XRAY_PATH="$p"; fi
-    [[ "$XRAY_PATH" == /* ]] || XRAY_PATH="/$XRAY_PATH"
+    printf "Path EXACTO ENTER para usar [${XRAY_PATH}]: "
+    IFS= read -r p
+    XRAY_PATH=$(normalize_path "$p" "$XRAY_PATH")
   fi
   if [[ "$XRAY_TRANSPORT" == 'grpc' ]]; then
     read -r -p "ServiceName gRPC [${XRAY_GRPC_SERVICE}]: " s
@@ -583,9 +583,9 @@ choose_xray80_profile() {
   esac
 
   if [[ "$XRAY80_TRANSPORT" == 'websocket' || "$XRAY80_TRANSPORT" == 'xhttp' || "$XRAY80_TRANSPORT" == 'httpupgrade' ]]; then
-    read -r -p "Path exclusivo Xray80 [${XRAY80_PATH}]: " p
-    [[ -n "$p" ]] && XRAY80_PATH="$p"
-    [[ "$XRAY80_PATH" == /* ]] || XRAY80_PATH="/$XRAY80_PATH"
+    printf "Path EXACTO Xray80 ENTER para usar [${XRAY80_PATH}]: "
+    IFS= read -r p
+    XRAY80_PATH=$(normalize_path "$p" "$XRAY80_PATH")
   fi
   if [[ "$XRAY80_TRANSPORT" == 'grpc' ]]; then
     read -r -p "ServiceName gRPC [${XRAY80_GRPC_SERVICE}]: " s
@@ -610,13 +610,16 @@ valid_uuid() {
   [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
 }
 
-normalize_path_value() {
-  local p="$1"
-  [[ -n "$p" ]] || return 1
-  [[ "$p" == /* ]] || p="/$p"
-  # Evitar romper la configuracion HAProxy cuando el path pertenece al puerto 80.
-  [[ "$p" != *$'\n'* && "$p" != *$'\r'* && "$p" != *'"'* ]] || return 1
-  printf '%s' "$p"
+normalize_path() {
+  local path="$1"
+  local def="$2"
+
+  # Misma logica del PANEL XRAY PROFESIONAL [ GOLDEN MX / XTLS + xHTTP ]:
+  # si esta vacio usa el valor por defecto; si escribes algo, se respeta
+  # EXACTAMENTE como fue capturado. No agrega /, no recorta espacios.
+  [[ -z "$path" ]] && path="$def"
+
+  echo "$path"
 }
 
 generate_default_path() {
@@ -721,35 +724,23 @@ create_xray_user() {
   selected_service="$current_grpc"
 
   if [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]]; then
-    if [[ "$existing_count" -gt 0 ]]; then
-      echo -e "${C_GOLD}Ya existen $existing_count usuario(s) en :$public_port.${C_RESET}"
-      echo 'ENTER conserva el Path actual para no romper los usuarios existentes.'
-      echo 'Escribe AUTO para generar uno nuevo, o escribe tu Path manual.'
-      read -r -p "Path [$current_path]: " path_input
-      if [[ -z "$path_input" ]]; then
-        selected_path="$current_path"
-      elif [[ "${path_input^^}" == 'AUTO' ]]; then
-        selected_path=$(generate_default_path "$public_port" "$name")
-      else
-        selected_path=$(normalize_path_value "$path_input") || { echo 'Path invalido.'; pause; return 0; }
-      fi
-      if [[ "$selected_path" != "$current_path" ]]; then
-        echo -e "${C_GOLD}Cambiar el Path de :$public_port cambia el Path para TODOS los usuarios de ese puerto.${C_RESET}"
-        read -r -p 'Escribe SI para aplicar el nuevo Path: ' confirm_path
-        if [[ "$confirm_path" != 'SI' ]]; then
-          selected_path="$current_path"
-          echo 'Se conserva el Path actual.'
-        fi
-      fi
+    # MISMA LOGICA DEL PANEL XRAY PROFESIONAL GOLDEN MX:
+    # IFS= read -r conserva los espacios de ambos extremos y NO agrega '/'.
+    # ENTER reutiliza exactamente el Path actual del inbound.
+    printf 'Path EXACTO ENTER para usar el del puerto: '
+    IFS= read -r path_input
+
+    if [[ -z "$path_input" ]]; then
+      selected_path="$current_path"
+    elif [[ "$path_input" == 'AUTO' ]]; then
+      selected_path=$(generate_default_path "$public_port" "$name")
     else
-      echo 'Puedes escribir tu Path exacto. Si dejas ENTER se genera automaticamente.'
-      read -r -p 'Path (ENTER = automatico): ' path_input
-      if [[ -z "$path_input" || "${path_input^^}" == 'AUTO' ]]; then
-        selected_path=$(generate_default_path "$public_port" "$name")
-      else
-        selected_path=$(normalize_path_value "$path_input") || { echo 'Path invalido.'; pause; return 0; }
-      fi
+      # Asignacion DIRECTA: ninguna normalizacion, trim, sed ni slash automatico.
+      selected_path="$path_input"
     fi
+
+    # El Path pertenece al inbound del puerto. Igual que Golden MX, si el usuario
+    # escribe uno nuevo se aplica directamente al inbound y a los usuarios de ese puerto.
   elif [[ "$transport" == 'grpc' ]]; then
     if [[ "$existing_count" -gt 0 ]]; then
       read -r -p "ServiceName gRPC [$current_grpc] (ENTER conserva): " service_input
@@ -826,7 +817,7 @@ create_xray_user() {
   echo "Usuario : $name"
   echo "Puerto  : $public_port"
   if [[ "$proto" == 'trojan' ]]; then echo "Password: $password"; else echo "UUID    : $uuid"; fi
-  [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]] && echo "Path    : $selected_path"
+  [[ "$transport" == 'websocket' || "$transport" == 'xhttp' || "$transport" == 'httpupgrade' ]] && printf 'Path    : [%s]\n' "$selected_path"
   [[ "$transport" == 'grpc' ]] && echo "gRPC    : $selected_service"
   bar
   if [[ "$public_port" -eq 443 ]]; then show_one_xray_user "$name"; else show_one_xray_user80 "$name"; fi
@@ -1502,36 +1493,137 @@ install_everything() {
 uninstall_xray_only() {
   read -r -p 'Escribe SI para desinstalar SOLO Xray: ' ok
   [[ "$ok" == 'SI' ]] || return 0
-  if [[ -f /tmp/xray-install-release.sh ]]; then
-    bash /tmp/xray-install-release.sh remove --purge || true
-  else
-    curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install-release.sh && bash /tmp/xray-install-release.sh remove --purge || true
+
+  # Parar primero cualquier instancia conocida y cualquier proceso residual Xray.
+  systemctl disable --now xray.service 2>/dev/null || true
+  systemctl disable --now xray 2>/dev/null || true
+  pkill -TERM -x xray 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x xray 2>/dev/null || true
+
+  # El instalador oficial puede no existir en /tmp despues de reiniciar; descargarlo si hace falta.
+  if [[ ! -s /tmp/xray-install-release.sh ]]; then
+    curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install-release.sh || true
   fi
+  if [[ -s /tmp/xray-install-release.sh ]]; then
+    bash /tmp/xray-install-release.sh remove --purge || true
+  fi
+
   rm -f "$XRAY_CONFIG"
-  echo 'Xray eliminado. HAProxy SSL/SSH queda intacto.'
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+  rm -rf /etc/systemd/system/xray.service.d
+  systemctl daemon-reload
+  systemctl reset-failed xray.service 2>/dev/null || true
+
+  echo
+  if ss -lntp 2>/dev/null | grep -Eq ':(10000|10080)([[:space:]]|$)'; then
+    echo -e "${C_RED}ATENCION: aun existe un listener en 10000/10080:${C_RESET}"
+    ss -lntp 2>/dev/null | grep -E ':(10000|10080)([[:space:]]|$)' || true
+  else
+    echo -e "${C_GREEN}Xray eliminado y puertos locales 10000/10080 cerrados.${C_RESET}"
+  fi
+  echo 'HAProxy SSL/SSH y ProxyGo quedan intactos.'
   pause
 }
 
+cleanup_proxygo_for_full_uninstall() {
+  # No llamar proxygo_uninstall() aqui porque esa funcion vuelve a escribir/reiniciar HAProxy.
+  systemctl disable --now proxygo_shared80.service 2>/dev/null || true
+  local f unit
+  for f in /etc/systemd/system/proxygo_[0-9]*.service; do
+    [[ -e "$f" ]] || continue
+    unit=$(basename "$f")
+    systemctl disable --now "$unit" 2>/dev/null || true
+  done
+  pkill -TERM -x proxygo 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x proxygo 2>/dev/null || true
+  rm -f /etc/systemd/system/proxygo_shared80.service /etc/systemd/system/proxygo_[0-9]*.service
+  rm -f "$PROXYGO_BIN"
+  rm -rf "$PROXYGO_SRC_DIR" "$PROXYGO_DIR"
+}
+
+show_remaining_manager_listeners() {
+  local left
+  left=$(ss -lntp 2>/dev/null | grep -E ':(80|443|10000|10080|18080)([[:space:]]|$)' || true)
+  if [[ -n "$left" ]]; then
+    echo -e "${C_RED}Quedan listeners en puertos usados por el manager:${C_RESET}"
+    printf '%s\n' "$left"
+    echo 'Si aparece un proceso distinto de haproxy/xray/proxygo, pertenece a otro servicio de la VPS.'
+    return 1
+  fi
+  echo -e "${C_GREEN}PASS: 80/443/10000/10080/18080 sin listeners del manager.${C_RESET}"
+  return 0
+}
+
 uninstall_all() {
-  read -r -p 'PELIGRO: escribe BORRAR para quitar HAProxy/Xray y este manager: ' ok
+  read -r -p 'PELIGRO: escribe BORRAR para quitar HAProxy/Xray/ProxyGo y este manager: ' ok
   [[ "$ok" == 'BORRAR' ]] || return 0
-  systemctl disable --now xray 2>/dev/null || true
+
+  echo 'Deteniendo servicios del manager...'
+  # Quitar autoarranque ANTES de matar procesos para que systemd no los levante otra vez.
+  systemctl disable --now haproxy.service 2>/dev/null || true
   systemctl disable --now haproxy 2>/dev/null || true
-  if [[ -f /tmp/xray-install-release.sh ]]; then
+  systemctl disable --now xray.service 2>/dev/null || true
+  systemctl disable --now xray 2>/dev/null || true
+  cleanup_proxygo_for_full_uninstall
+
+  pkill -TERM -x xray 2>/dev/null || true
+  pkill -TERM -x haproxy 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x xray 2>/dev/null || true
+  pkill -KILL -x haproxy 2>/dev/null || true
+
+  # Desinstalar Xray aunque /tmp se haya limpiado tras un reboot.
+  if [[ ! -s /tmp/xray-install-release.sh ]]; then
+    curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o /tmp/xray-install-release.sh || true
+  fi
+  if [[ -s /tmp/xray-install-release.sh ]]; then
     bash /tmp/xray-install-release.sh remove --purge || true
   fi
-  # Restore earliest backups when available.
-  local hbak xbak
-  hbak=$(find "$BACKUP_DIR" -maxdepth 1 -name 'haproxy.cfg-*.bak' | sort | head -n1)
-  xbak=$(find "$BACKUP_DIR" -maxdepth 1 -name 'xray-config.json-*.bak' | sort | head -n1)
-  [[ -n "$hbak" ]] && cp -a "$hbak" "$HA_CFG"
-  [[ -n "$xbak" ]] && cp -a "$xbak" "$XRAY_CONFIG"
-  rm -f /etc/sysctl.d/99-ssl-v2ray443-manager.conf /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf
+
+  # Restaurar HAProxy previo solo como archivo, pero dejar el servicio DETENIDO/DESHABILITADO.
+  local hbak
+  hbak=$(find "$BACKUP_DIR" -maxdepth 1 -name 'haproxy.cfg-*.bak' 2>/dev/null | sort | head -n1)
+  if [[ -n "$hbak" ]]; then
+    cp -a "$hbak" "$HA_CFG"
+  else
+    rm -f "$HA_CFG"
+  fi
+
+  rm -f "$XRAY_CONFIG"
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
   rm -rf /etc/systemd/system/haproxy.service.d /etc/systemd/system/xray.service.d
+  rm -f /etc/sysctl.d/99-ssl-v2ray443-manager.conf /etc/sysctl.d/99-ssl-xray-proxygo-manager.conf
   rm -f /etc/letsencrypt/renewal-hooks/deploy/ssl-v2ray443-haproxy.sh
+  rm -f "$INFO_FILE" "$HA_CERT"
+
+  # El estado y usuarios del manager tambien se eliminan en DESINSTALAR TODO.
+  rm -rf "$BASE_DIR"
+
   systemctl daemon-reload
-  echo 'Desinstalacion terminada. Los usuarios Linux/SSH no fueron borrados.'
-  pause
+  systemctl reset-failed haproxy.service xray.service proxygo_shared80.service 2>/dev/null || true
+
+  # Ultimo barrido solo de procesos propios por si quedaron hijos fuera de systemd.
+  pkill -KILL -x xray 2>/dev/null || true
+  pkill -KILL -x proxygo 2>/dev/null || true
+  pkill -KILL -x haproxy 2>/dev/null || true
+  sleep 1
+
+  echo
+  bar
+  echo -e "${C_GOLD}             RESULTADO DESINSTALACION COMPLETA${C_RESET}"
+  bar
+  printf 'HAProxy : '; service_is_active haproxy && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
+  printf 'Xray    : '; service_is_active xray && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
+  printf 'ProxyGo : '; service_is_active proxygo_shared80 && echo -e "${C_RED}ACTIVO${C_RESET}" || echo -e "${C_GREEN}INACTIVO${C_RESET}"
+  show_remaining_manager_listeners || true
+  bar
+  echo 'Los usuarios Linux/SSH NO fueron borrados. SSH :22 queda intacto.'
+  echo 'El script multi_80_443.sh se conserva para que puedas reinstalarlo si quieres.'
+  echo
+  read -r -p 'ENTER para salir del manager...' _
+  exit 0
 }
 
 main_menu() {
@@ -1539,7 +1631,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.3.1 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
