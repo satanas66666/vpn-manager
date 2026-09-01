@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.4 PORT80 ROUTER FIX - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.5 PORT80 DUAL ROUTER FIX - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -288,15 +288,30 @@ write_haproxy_config() {
     route_path_uri="${route_path_uri//%2F//}"
 
     case "$XRAY80_TRANSPORT" in
-      websocket|httpupgrade)
-        # Both Xray WebSocket and HTTPUpgrade send the standard HTTP/1.1
-        # Upgrade: websocket handshake. Route by that stable signature, not by
-        # Path, so manual paths with no slash/spaces/emojis keep working.
+      websocket)
+        # Genuine Xray WebSocket must match BOTH its normalized wire Path and
+        # the WebSocket handshake (including Sec-WebSocket-Key).  ProxyGo stays
+        # the default backend, so generic HTTP injector payloads containing
+        # "Upgrade: websocket" are not stolen by Xray.
         x80_acl=$(cat <<EOF
+    acl is_xray80_path    req.payload(0,0) -m sub -i " ${route_path_uri}"
+    acl is_xray80_upgrade req.payload(0,0) -m sub -i "Upgrade: websocket"
+    acl is_xray80_wskey   req.payload(0,0) -m sub -i "Sec-WebSocket-Key:"
+    tcp-request content accept if is_xray80_path is_xray80_upgrade is_xray80_wskey
+    use_backend xray_80 if is_xray80_path is_xray80_upgrade is_xray80_wskey
+EOF
+)
+        ;;
+      httpupgrade)
+        # HTTPUpgrade does not require the WebSocket key used by real WS.
+        # Keep the configured wire Path in the discriminator so ProxyGo remains
+        # the fallback for unrelated/custom Upgrade payloads.
+        x80_acl=$(cat <<EOF
+    acl is_xray80_path    req.payload(0,0) -m sub -i " ${route_path_uri}"
     acl is_xray80_upgrade req.payload(0,0) -m sub -i "Upgrade: websocket"
     acl is_xray80_connup  req.payload(0,0) -m sub -i "Connection: Upgrade"
-    tcp-request content accept if is_xray80_upgrade is_xray80_connup
-    use_backend xray_80 if is_xray80_upgrade is_xray80_connup
+    tcp-request content accept if is_xray80_path is_xray80_upgrade is_xray80_connup
+    use_backend xray_80 if is_xray80_path is_xray80_upgrade is_xray80_connup
 EOF
 )
         ;;
@@ -1673,7 +1688,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.4 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.5 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
