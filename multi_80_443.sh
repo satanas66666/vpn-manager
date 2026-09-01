@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.8 PROXYGO GOLDEN EXACT - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.8.1 PROXYGO GOLDEN EXACT - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -1112,12 +1112,64 @@ proxygo_compile_golden() {
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"time"
 )
+
+const (
+	firstPayloadWait = 3 * time.Second
+	streamSettleWait = 120 * time.Millisecond
+	maxInitialData   = 64 * 1024
+)
+
+// readGoldenInjection keeps the public Golden handshake unchanged, but fixes
+// the one thing that is not safe behind a TCP multiplexer: assuming one Read()
+// equals one complete injector payload. HAProxy may split/coalesce the stream.
+//
+// Every byte received before the SSH identification is injection data and must
+// NOT reach sshd. If HTTP Custom pipelines its SSH identification early, keep
+// that tail and replay it to sshd instead of discarding it.
+func readGoldenInjection(client net.Conn) []byte {
+	buf := make([]byte, 4096)
+	seen := make([]byte, 0, 8192)
+	first := true
+
+	for len(seen) < maxInitialData {
+		if first {
+			_ = client.SetReadDeadline(time.Now().Add(firstPayloadWait))
+		} else {
+			_ = client.SetReadDeadline(time.Now().Add(streamSettleWait))
+		}
+
+		n, err := client.Read(buf)
+		if n > 0 {
+			seen = append(seen, buf[:n]...)
+			first = false
+
+			// SSH identification may already be in the same/coalesced TCP stream.
+			// Preserve it and everything after it for the real SSH backend.
+			if idx := bytes.Index(seen, []byte("SSH-2.0-")); idx >= 0 {
+				tail := append([]byte(nil), seen[idx:]...)
+				_ = client.SetReadDeadline(time.Time{})
+				return tail
+			}
+		}
+
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				break
+			}
+			break
+		}
+	}
+
+	_ = client.SetReadDeadline(time.Time{})
+	return nil
+}
 
 func handle(client net.Conn, target string, banner string) {
 	defer client.Close()
@@ -1132,17 +1184,20 @@ func handle(client net.Conn, target string, banner string) {
 		banner = "OK"
 	}
 
-	// Primera respuesta fija
-	_, _ = client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n"))
+	// Golden original: first fixed response.
+	if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
+		return
+	}
 
-	// Leer y tirar payload inicial para que NO llegue al SSH
-	client.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buffer := make([]byte, 1024)
-	_, _ = client.Read(buffer)
-	client.SetReadDeadline(time.Time{})
+	// Golden semantic: discard injector payload before SSH. Unlike the original
+	// single Read(1024), this is stream-safe behind HAProxy and preserves an SSH
+	// identification if HTTP Custom pipelines it in the same TCP segment.
+	sshPrefix := readGoldenInjection(client)
 
-	// Aquí aparece el banner
-	_, _ = client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner)))
+	// Golden original: banner response before opening the SSH backend.
+	if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
+		return
+	}
 
 	server, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
@@ -1156,18 +1211,23 @@ func handle(client net.Conn, target string, banner string) {
 		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
 	}
 
-	done := make(chan struct{}, 2)
+	// If HAProxy coalesced/pipelined SSH identification with the injector data,
+	// replay it exactly once to sshd before starting transparent relay.
+	if len(sshPrefix) > 0 {
+		if _, err := server.Write(sshPrefix); err != nil {
+			return
+		}
+	}
 
+	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(server, client)
 		done <- struct{}{}
 	}()
-
 	go func() {
 		_, _ = io.Copy(client, server)
 		done <- struct{}{}
 	}()
-
 	<-done
 }
 
@@ -1182,7 +1242,7 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println("ProxyGo ONLINE", *listen, "->", *target, "BANNER:", *banner)
+	fmt.Println("ProxyGo NEW GOLDEN STREAM-SAFE ONLINE", *listen, "->", *target, "BANNER:", *banner)
 
 	for {
 		conn, err := ln.Accept()
@@ -1197,7 +1257,7 @@ EOF
   chmod 755 "$PROXYGO_BIN"
   "$PROXYGO_BIN" -h >/dev/null 2>&1 || return 1
   sha256sum "$PROXYGO_BIN" > "$PROXYGO_DIR/.binary.sha256"
-  printf 'NEW-GOLDEN robust-payload-v3.6 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
+  printf 'NEW-GOLDEN stream-safe-v3.9 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
 }
 
 proxygo_write_shared80_service() {
@@ -1900,7 +1960,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.6 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.9 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
