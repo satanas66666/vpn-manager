@@ -1112,152 +1112,199 @@ proxygo_compile_golden() {
 package main
 
 import (
-	"bytes"
-	"flag"
-	"fmt"
-	"io"
-	"net"
-	"time"
+    "bytes"
+    "flag"
+    "fmt"
+    "io"
+    "net"
+    "time"
 )
 
-const (
-	firstPayloadWait = 3 * time.Second
-	streamSettleWait = 120 * time.Millisecond
-	maxInitialData   = 64 * 1024
-)
+const sshGateTimeout = 15 * time.Second
 
-// readGoldenInjection keeps the public Golden handshake unchanged, but fixes
-// the one thing that is not safe behind a TCP multiplexer: assuming one Read()
-// equals one complete injector payload. HAProxy may split/coalesce the stream.
-//
-// Every byte received before the SSH identification is injection data and must
-// NOT reach sshd. If HTTP Custom pipelines its SSH identification early, keep
-// that tail and replay it to sshd instead of discarding it.
-func readGoldenInjection(client net.Conn) []byte {
-	buf := make([]byte, 4096)
-	seen := make([]byte, 0, 8192)
-	first := true
+// findSSHIdentification returns the first real SSH identification line.  It
+// only accepts SSH-2.0- at the beginning of a line so payload text containing
+// those characters elsewhere cannot be mistaken for the SSH handshake.
+func findSSHIdentification(b []byte) int {
+    needle := []byte("SSH-2.0-")
+    from := 0
+    for {
+        i := bytes.Index(b[from:], needle)
+        if i < 0 {
+            return -1
+        }
+        i += from
+        if i == 0 || b[i-1] == '\n' {
+            return i
+        }
+        from = i + 1
+        if from >= len(b) {
+            return -1
+        }
+    }
+}
 
-	for len(seen) < maxInitialData {
-		if first {
-			_ = client.SetReadDeadline(time.Now().Add(firstPayloadWait))
-		} else {
-			_ = client.SetReadDeadline(time.Now().Add(streamSettleWait))
-		}
+// forwardServerIdentification forwards the SSH server banner immediately.
+// If sshd coalesces KEX bytes in the same TCP read they are forwarded too;
+// the SSH client is allowed to receive them right after the identification.
+func forwardServerIdentification(server, client net.Conn) error {
+    _ = server.SetReadDeadline(time.Now().Add(sshGateTimeout))
+    defer server.SetReadDeadline(time.Time{})
 
-		n, err := client.Read(buf)
-		if n > 0 {
-			seen = append(seen, buf[:n]...)
-			first = false
+    buf := make([]byte, 4096)
+    acc := make([]byte, 0, 4096)
+    for len(acc) < 64*1024 {
+        n, err := server.Read(buf)
+        if n > 0 {
+            acc = append(acc, buf[:n]...)
+            if idx := bytes.Index(acc, []byte("SSH-2.0-")); idx >= 0 {
+                if eol := bytes.IndexByte(acc[idx:], '\n'); eol >= 0 {
+                    _, werr := client.Write(acc)
+                    return werr
+                }
+            }
+        }
+        if err != nil {
+            return err
+        }
+    }
+    return fmt.Errorf("SSH server identification too large")
+}
 
-			// SSH identification may already be in the same/coalesced TCP stream.
-			// Preserve it and everything after it for the real SSH backend.
-			if idx := bytes.Index(seen, []byte("SSH-2.0-")); idx >= 0 {
-				tail := append([]byte(nil), seen[idx:]...)
-				_ = client.SetReadDeadline(time.Time{})
-				return tail
-			}
-		}
+// forwardClientFromSSHIdentification is the key compatibility gate for
+// HAProxy/shared :80.  Anything HTTP Custom sends before its actual SSH
+// identification is injector residue and is discarded.  Only from the real
+// SSH-2.0- line onward is allowed to reach sshd.
+func forwardClientFromSSHIdentification(client, server net.Conn, initial []byte) error {
+    _ = client.SetReadDeadline(time.Now().Add(sshGateTimeout))
+    defer client.SetReadDeadline(time.Time{})
 
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				break
-			}
-			break
-		}
-	}
+    acc := append([]byte(nil), initial...)
+    buf := make([]byte, 4096)
 
-	_ = client.SetReadDeadline(time.Time{})
-	return nil
+    for len(acc) < 256*1024 {
+        if idx := findSSHIdentification(acc); idx >= 0 {
+            _, err := server.Write(acc[idx:])
+            return err
+        }
+
+        n, err := client.Read(buf)
+        if n > 0 {
+            acc = append(acc, buf[:n]...)
+        }
+        if err != nil {
+            return err
+        }
+    }
+    return fmt.Errorf("SSH client identification not found")
 }
 
 func handle(client net.Conn, target string, banner string) {
-	defer client.Close()
+    defer client.Close()
 
-	if tcp, ok := client.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
-	}
+    if tcp, ok := client.(*net.TCPConn); ok {
+        _ = tcp.SetNoDelay(true)
+        _ = tcp.SetKeepAlive(true)
+        _ = tcp.SetKeepAlivePeriod(60 * time.Second)
+    }
 
-	if banner == "" {
-		banner = "OK"
-	}
+    if banner == "" {
+        banner = "OK"
+    }
 
-	// Golden original: first fixed response.
-	if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
-		return
-	}
+    // Public behavior kept identical to PROXYGO NEW GOLDEN.
+    if _, err := client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n")); err != nil {
+        return
+    }
 
-	// Golden semantic: discard injector payload before SSH. Unlike the original
-	// single Read(1024), this is stream-safe behind HAProxy and preserves an SSH
-	// identification if HTTP Custom pipelines it in the same TCP segment.
-	sshPrefix := readGoldenInjection(client)
+    // Keep Golden's original one-read injector consumption.  Unlike Golden,
+    // any fragment that arrives later is still filtered by the SSH gate below,
+    // so it can never contaminate sshd.
+    first := make([]byte, 1024)
+    _ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+    nFirst, _ := client.Read(first)
+    _ = client.SetReadDeadline(time.Time{})
+    first = first[:max(0, nFirst)]
 
-	// Golden original: banner response before opening the SSH backend.
-	if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
-		return
-	}
+    if _, err := client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner))); err != nil {
+        return
+    }
 
-	server, err := net.DialTimeout("tcp", target, 10*time.Second)
-	if err != nil {
-		return
-	}
-	defer server.Close()
+    server, err := net.DialTimeout("tcp", target, 10*time.Second)
+    if err != nil {
+        return
+    }
+    defer server.Close()
 
-	if tcp, ok := server.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
-	}
+    if tcp, ok := server.(*net.TCPConn); ok {
+        _ = tcp.SetNoDelay(true)
+        _ = tcp.SetKeepAlive(true)
+        _ = tcp.SetKeepAlivePeriod(60 * time.Second)
+    }
 
-	// If HAProxy coalesced/pipelined SSH identification with the injector data,
-	// replay it exactly once to sshd before starting transparent relay.
-	if len(sshPrefix) > 0 {
-		if _, err := server.Write(sshPrefix); err != nil {
-			return
-		}
-	}
+    // Let HTTP Custom see the real SSH server banner first, exactly as in a
+    // normal SSH connection.  Do not start raw client->server copying yet.
+    if err := forwardServerIdentification(server, client); err != nil {
+        return
+    }
 
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(server, client)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(client, server)
-		done <- struct{}{}
-	}()
-	<-done
+    // If the initial Golden read already contained an early SSH identification,
+    // preserve it; otherwise discard it as injector payload.  Then keep reading
+    // and discard ALL remaining HTTP residue until the real SSH identification
+    // arrives.  Only SSH bytes are ever sent to sshd.
+    initialSSH := []byte(nil)
+    if idx := findSSHIdentification(first); idx >= 0 {
+        initialSSH = first[idx:]
+    }
+    if err := forwardClientFromSSHIdentification(client, server, initialSSH); err != nil {
+        return
+    }
+
+    done := make(chan struct{}, 2)
+    go func() {
+        _, _ = io.Copy(server, client)
+        done <- struct{}{}
+    }()
+    go func() {
+        _, _ = io.Copy(client, server)
+        done <- struct{}{}
+    }()
+    <-done
+}
+
+func max(a, b int) int {
+    if a > b { return a }
+    return b
 }
 
 func main() {
-	listen := flag.String("listen", "0.0.0.0:80", "listen address")
-	target := flag.String("target", "127.0.0.1:22", "target address")
-	banner := flag.String("banner", "OK", "banner en respuesta 200")
-	flag.Parse()
+    listen := flag.String("listen", "0.0.0.0:80", "listen address")
+    target := flag.String("target", "127.0.0.1:22", "target address")
+    banner := flag.String("banner", "OK", "banner en respuesta 200")
+    flag.Parse()
 
-	ln, err := net.Listen("tcp", *listen)
-	if err != nil {
-		panic(err)
-	}
+    ln, err := net.Listen("tcp", *listen)
+    if err != nil {
+        panic(err)
+    }
 
-	fmt.Println("ProxyGo NEW GOLDEN STREAM-SAFE ONLINE", *listen, "->", *target, "BANNER:", *banner)
+    fmt.Println("ProxyGo NEW GOLDEN SSH-GATE ONLINE", *listen, "->", *target, "BANNER:", *banner)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
-		}
-		go handle(conn, *target, *banner)
-	}
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            time.Sleep(50 * time.Millisecond)
+            continue
+        }
+        go handle(conn, *target, *banner)
+    }
 }
 EOF
   (cd "$PROXYGO_SRC_DIR" && go build -ldflags='-s -w' -o "$PROXYGO_BIN" main.go) || return 1
   chmod 755 "$PROXYGO_BIN"
   "$PROXYGO_BIN" -h >/dev/null 2>&1 || return 1
   sha256sum "$PROXYGO_BIN" > "$PROXYGO_DIR/.binary.sha256"
-  printf 'NEW-GOLDEN stream-safe-v3.9 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
+  printf 'NEW-GOLDEN ssh-gate-v4.0 %s\n' "$(date '+%F %T')" > "$PROXYGO_DIR/.golden-installed"
 }
 
 proxygo_write_shared80_service() {
@@ -1960,7 +2007,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.9 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V4.0 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
