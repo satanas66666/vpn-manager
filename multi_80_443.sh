@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.3.1 - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V3.4 PORT80 ROUTER FIX - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -274,10 +274,45 @@ write_haproxy_config() {
   local x80_acl=''
   local x80_backend=''
   if [[ "$XRAY80_ENABLED" == '1' ]]; then
-    # Port 80 can only be safely multiplexed when Xray traffic is identifiable
-    # as HTTP-like traffic (WS / HTTPUpgrade / XHTTP) or h2c (gRPC/XHTTP).
-    x80_acl=$(cat <<EOF
-    acl is_xray80_path req.payload(0,0) -m sub " ${XRAY80_PATH}"
+    # PORT 80 SHARING FIX:
+    # ProxyGo NEW GOLDEN remains the default/backend and is not modified.
+    # Xray traffic is identified by the transport signature instead of relying
+    # only on the literal Path. This is required because Xray normalizes an
+    # HTTP path without a leading slash (e.g. alex -> /alex) and HTTP clients
+    # percent-encode spaces/UTF-8 on the wire.
+    local route_path route_path_no_query route_path_uri
+    route_path_no_query="${XRAY80_PATH%%\?*}"
+    [[ -n "$route_path_no_query" ]] || route_path_no_query='/'
+    [[ "$route_path_no_query" == /* ]] || route_path_no_query="/$route_path_no_query"
+    route_path_uri=$(jq -nr --arg v "$route_path_no_query" '$v|@uri')
+    route_path_uri="${route_path_uri//%2F//}"
+
+    case "$XRAY80_TRANSPORT" in
+      websocket|httpupgrade)
+        # Both Xray WebSocket and HTTPUpgrade send the standard HTTP/1.1
+        # Upgrade: websocket handshake. Route by that stable signature, not by
+        # Path, so manual paths with no slash/spaces/emojis keep working.
+        x80_acl=$(cat <<EOF
+    acl is_xray80_upgrade req.payload(0,0) -m sub -i "Upgrade: websocket"
+    acl is_xray80_connup  req.payload(0,0) -m sub -i "Connection: Upgrade"
+    tcp-request content accept if is_xray80_upgrade is_xray80_connup
+    use_backend xray_80 if is_xray80_upgrade is_xray80_connup
+EOF
+)
+        ;;
+      grpc)
+        x80_acl=$(cat <<'EOF'
+    acl is_xray80_h2 req.payload(0,14) -m str "PRI * HTTP/2.0"
+    tcp-request content accept if is_xray80_h2
+    use_backend xray_80 if is_xray80_h2
+EOF
+)
+        ;;
+      xhttp)
+        # XHTTP can arrive over HTTP/1.1 or HTTP/2. For HTTP/1.1 match the
+        # normalized percent-encoded wire path; for h2 route by the preface.
+        x80_acl=$(cat <<EOF
+    acl is_xray80_path req.payload(0,0) -m sub -i " ${route_path_uri}"
     acl is_xray80_h2 req.payload(0,14) -m str "PRI * HTTP/2.0"
     tcp-request content accept if is_xray80_path
     tcp-request content accept if is_xray80_h2
@@ -285,6 +320,13 @@ write_haproxy_config() {
     use_backend xray_80 if is_xray80_h2
 EOF
 )
+        ;;
+      *)
+        echo 'ERROR: transporte Xray80 no soportado para sharing en 80.' >&2
+        return 1
+        ;;
+    esac
+
     x80_backend=$(cat <<EOF
 
 backend xray_80
@@ -1631,7 +1673,7 @@ main_menu() {
     load_state
     safe_clear
     bar
-    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.3.1 ]${C_RESET}"
+    echo -e "${C_GOLD} SSL + V2RAY/XRAY + PROXYGO [ 80/443 SHARED MANAGER V3.4 ]${C_RESET}"
     bar
     printf ' HAPROXY     : '; if service_is_active haproxy; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
     printf ' XRAY        : '; if service_is_active xray; then echo -e "${C_GREEN}ACTIVO${C_RESET}"; else echo -e "${C_RED}INACTIVO${C_RESET}"; fi
