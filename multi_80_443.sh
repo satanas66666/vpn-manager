@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ================================================================
-# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V4.4 LATENCY + KEEPALIVE CANDIDATE - INDEPENDIENTE
+# SSL + V2RAY/XRAY + PROXYGO 80/443 MANAGER V4.5 PROXYGO RECONNECT + FAST HANDSHAKE FIX - INDEPENDIENTE
 # Target: Ubuntu 20.04/22.04/24.04 + Debian 11/12/13 (apt/systemd)
 # Public TCP/443 is owned by HAProxy.
 #   - SSH-over-SSL: TLS -> HAProxy -> local OpenSSH :22
@@ -1117,12 +1117,36 @@ proxygo_compile_golden() {
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"time"
 )
+
+func findSSHIdent(b []byte) int {
+	needles := [][]byte{[]byte("SSH-2.0-"), []byte("SSH-1.99-")}
+	best := -1
+	for _, needle := range needles {
+		from := 0
+		for from < len(b) {
+			i := bytes.Index(b[from:], needle)
+			if i < 0 { break }
+			i += from
+			if i == 0 || b[i-1] == '\n' || b[i-1] == '\r' {
+				if best < 0 || i < best { best = i }
+				break
+			}
+			from = i + 1
+		}
+	}
+	return best
+}
+
+func closeWrite(c net.Conn) {
+	if t, ok := c.(*net.TCPConn); ok { _ = t.CloseWrite() }
+}
 
 func handle(client net.Conn, target string, banner string) {
 	defer client.Close()
@@ -1140,13 +1164,20 @@ func handle(client net.Conn, target string, banner string) {
 	// Primera respuesta fija
 	_, _ = client.Write([]byte("HTTP/1.1 101 Connection Established\r\n\r\n"))
 
-	// Leer y tirar payload inicial para que NO llegue al SSH
-	client.SetReadDeadline(time.Now().Add(3 * time.Second))
-	buffer := make([]byte, 1024)
-	_, _ = client.Read(buffer)
+	// Consumir SOLO la inyección inicial. Si el cliente encadena su identificación
+	// SSH en el mismo paquete (común al reconectar), preservarla para no perder KEX.
+	client.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+	buffer := make([]byte, 4096)
+	n, _ := client.Read(buffer)
 	client.SetReadDeadline(time.Time{})
+	var pendingSSH []byte
+	if n > 0 {
+		if idx := findSSHIdent(buffer[:n]); idx >= 0 {
+			pendingSSH = append([]byte(nil), buffer[idx:n]...)
+		}
+	}
 
-	// Aquí aparece el banner
+	// Mantener exactamente el banner/protocolo existente.
 	_, _ = client.Write([]byte(fmt.Sprintf("HTTP/1.1 200 %s\r\n\r\n", banner)))
 
 	server, err := net.DialTimeout("tcp", target, 10*time.Second)
@@ -1161,18 +1192,27 @@ func handle(client net.Conn, target string, banner string) {
 		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
 	}
 
+	// Si SSH llegó junto con el payload inicial, entregarlo antes del copy normal.
+	if len(pendingSSH) > 0 {
+		if _, err := server.Write(pendingSSH); err != nil { return }
+	}
+
 	done := make(chan struct{}, 2)
 
 	go func() {
 		_, _ = io.Copy(server, client)
+		closeWrite(server)
 		done <- struct{}{}
 	}()
 
 	go func() {
 		_, _ = io.Copy(client, server)
+		closeWrite(client)
 		done <- struct{}{}
 	}()
 
+	// Al terminar una mitad, cerrar la sesión completa de forma determinista.
+	// Evita sockets viejos retenidos que contaminen la siguiente reconexión.
 	<-done
 }
 
@@ -1239,7 +1279,7 @@ import (
 )
 
 const (
-    gateTimeout = 20 * time.Second
+    gateTimeout = 6 * time.Second
     maxPrefix   = 256 * 1024
 )
 
